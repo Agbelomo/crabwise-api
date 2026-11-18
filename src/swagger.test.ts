@@ -21,11 +21,27 @@ interface Tag {
   readonly description?: string;
 }
 
+type SecurityRequirement = Readonly<Record<string, readonly string[]>>;
+
 const spec = openApiSpec as {
-  readonly paths: Record<string, Record<string, unknown>>;
+  readonly paths: Record<
+    string,
+    Record<string, { readonly security?: readonly SecurityRequirement[] }>
+  >;
+  readonly security: readonly SecurityRequirement[];
   readonly components: { readonly schemas: Record<string, unknown> };
   readonly tags: readonly Tag[];
 };
+
+const PROTECTED_OPERATIONS: ReadonlyArray<readonly [string, string]> = [
+  ['/api/v1/auth/me', 'get'],
+  ['/api/v1/users/me', 'patch'],
+];
+
+const PUBLIC_OPERATIONS: ReadonlyArray<readonly [string, string]> = [
+  ['/api/v1/auth/login', 'post'],
+  ['/api/v1/marketplace', 'get'],
+];
 
 /** Every commission operation the API actually serves. */
 const COMMISSION_OPERATIONS: ReadonlyArray<readonly [string, string]> = [
@@ -79,6 +95,20 @@ describe('OpenAPI document (#830)', () => {
 
   it.each(COMMISSION_OPERATIONS)('documents %s %s', (path, method) => {
     expect(spec.paths[path]?.[method]).toBeDefined();
+  });
+
+  it('uses opt-in authentication for operations', () => {
+    expect(spec.security).toEqual([]);
+  });
+
+  it.each(PROTECTED_OPERATIONS)('requires bearer auth for %s %s', (path, method) => {
+    expect(spec.paths[path]?.[method]?.security).toEqual([{ BearerAuth: [] }]);
+  });
+
+  it.each(PUBLIC_OPERATIONS)('keeps %s %s public', (path, method) => {
+    const operation = spec.paths[path]?.[method];
+    expect(operation).toBeDefined();
+    expect(operation?.security ?? spec.security).toEqual([]);
   });
 
   it.each(COMMISSION_SCHEMAS)('exports the %s schema', (name) => {
