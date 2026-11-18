@@ -28,6 +28,8 @@ export const openApiSpec = swaggerJsdoc({
     // Paths in route annotations are absolute (e.g. `/api/v1/auth/login`), so
     // the server root is `/` — otherwise "Try it out" would double the prefix.
     servers: [{ url: '/', description: `This server (${env.nodeEnv})` }],
+    // Authentication is opt-in per operation so public routes stay public.
+    security: [],
     tags: [
       { name: 'Auth', description: 'Registration, login, sessions and the current user.' },
       { name: 'Users', description: 'User profile management.' },
