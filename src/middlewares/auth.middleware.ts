@@ -22,13 +22,17 @@ export const authenticate: RequestHandler = (req, _res, next) => {
   const header = req.headers.authorization;
   const match = header === undefined ? null : /^Bearer\s+(\S+)$/i.exec(header);
   if (match === null || match[1] === undefined) {
-    next(new AppError('UNAUTHORIZED', 'Missing or malformed Authorization header'));
+    next(new AppError('UNAUTHORIZED', 'Authentication required'));
     return;
   }
   try {
     (req as AuthenticatedRequest).user = verifyAccessToken(match[1]);
     next();
   } catch (err) {
+    if (err instanceof AppError && err.code === 'UNAUTHORIZED') {
+      next(new AppError('UNAUTHORIZED', 'Authentication required'));
+      return;
+    }
     next(err);
   }
 };

@@ -1,4 +1,4 @@
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { verifyMock, loggerMock } = vi.hoisted(() => ({
@@ -10,13 +10,47 @@ vi.mock('@/services/token.service', () => ({ verifyAccessToken: verifyMock }));
 vi.mock('@/utils/logger', () => ({ logger: loggerMock }));
 
 import { AppError } from './app-error.middleware';
-import { getOptionalAuthUser } from './auth.middleware';
+import { authenticate, getOptionalAuthUser } from './auth.middleware';
 
 const reqWith = (authorization?: string): Request =>
   ({ headers: authorization === undefined ? {} : { authorization } }) as Request;
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+describe('authenticate', () => {
+  it.each([
+    ['missing', undefined],
+    ['malformed', 'Bearer'],
+    ['expired', 'Bearer expired'],
+  ])('rejects %s credentials consistently', (_label, authorization) => {
+    if (authorization === 'Bearer expired') {
+      verifyMock.mockImplementation(() => {
+        throw new AppError('UNAUTHORIZED', 'Access token expired');
+      });
+    }
+    const next = vi.fn();
+
+    authenticate(reqWith(authorization), {} as Response, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'UNAUTHORIZED', message: 'Authentication required' }),
+    );
+  });
+
+  it('propagates non-authorization verification errors', () => {
+    const configError = new AppError('INTERNAL_ERROR', 'JWT secret is not configured');
+    verifyMock.mockImplementation(() => {
+      throw configError;
+    });
+    const next = vi.fn();
+
+    authenticate(reqWith('Bearer token'), {} as Response, next);
+
+    expect(next).toHaveBeenCalledWith(configError);
+  });
 });
 
 describe('getOptionalAuthUser', () => {
