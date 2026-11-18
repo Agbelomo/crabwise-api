@@ -66,6 +66,44 @@ describe('env', () => {
     process.env = { ...original };
   });
 
+  describe('required configuration', () => {
+    it('reports missing required variables by name with an actionable message', async () => {
+      await expect(
+        loadEnv({
+          DATABASE_URL: undefined,
+          JWT_SECRET: undefined,
+          JWT_REFRESH_SECRET: undefined,
+        }),
+      ).rejects.toThrow(
+        /DATABASE_URL is required[\s\S]*JWT_SECRET is required[\s\S]*JWT_REFRESH_SECRET is required/,
+      );
+    });
+
+    it('does not expose secret values in validation errors', async () => {
+      const databaseUrl = 'postgresql://db-user:db-password@localhost:5432/app';
+      const jwtSecret = 'short-access';
+      const jwtRefreshSecret = 'short-refresh';
+      const error = await loadEnv({
+        DATABASE_URL: databaseUrl,
+        JWT_SECRET: jwtSecret,
+        JWT_REFRESH_SECRET: jwtRefreshSecret,
+      }).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+
+      expect(error).toBeInstanceOf(Error);
+      if (!(error instanceof Error)) return;
+
+      expect(error.message).toContain('JWT_SECRET');
+      expect(error.message).toContain('JWT_REFRESH_SECRET');
+      expect(error.message).not.toContain(databaseUrl);
+      expect(error.message).not.toContain('db-password');
+      expect(error.message).not.toContain(jwtSecret);
+      expect(error.message).not.toContain(jwtRefreshSecret);
+    });
+  });
+
   describe('BCRYPT_COST', () => {
     it('defaults to 12 outside the test environment', async () => {
       expect((await loadEnv({ NODE_ENV: 'development' })).bcryptCost).toBe(12);

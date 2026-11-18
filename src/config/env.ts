@@ -76,7 +76,7 @@ const schema = z.object({
     .max(65535, PORT_ERROR)
     .default(DEFAULT_PORT),
   DATABASE_URL: z
-    .string()
+    .string({ error: 'DATABASE_URL is required (postgresql://user:pass@host:5432/db).' })
     .min(1, 'DATABASE_URL is required (postgresql://user:pass@host:5432/db).'),
   DATABASE_POOL_SIZE: z.coerce
     .number({ error: 'DATABASE_POOL_SIZE must be a positive integer.' })
