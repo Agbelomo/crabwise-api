@@ -71,6 +71,105 @@ describe('createOrGetThread (#837)', () => {
     expect(result.created).toBe(true);
     expect(result.thread.id).toBe('t-new');
   });
+
+  it('recovers from a unique-constraint race by returning the existing thread (#113)', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u2' });
+    // First findMany returns nothing (race: other request wins the INSERT)
+    prismaMock.threadParticipant.findMany
+      .mockResolvedValueOnce([]) // findThreadBetween pre-create
+      .mockResolvedValueOnce([   // findThreadBetween recovery after P2002
+        { threadId: 't-race', userId: 'u1' },
+        { threadId: 't-race', userId: 'u2' },
+      ]);
+    prismaMock.messageThread.create.mockRejectedValue({ code: 'P2002' });
+    prismaMock.messageThread.findUnique.mockResolvedValue({
+      id: 't-race',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      participants: [{ userId: 'u1' }, { userId: 'u2' }],
+    });
+    prismaMock.user.findMany.mockResolvedValue([
+      { id: 'u1', name: 'A', username: 'a' },
+      { id: 'u2', name: 'B', username: 'b' },
+    ]);
+
+    const result = await createOrGetThread('u1', { participantId: 'u2' });
+    expect(result.created).toBe(false);
+    expect(result.thread.id).toBe('t-race');
+  });
+
+  it('resolves to the same thread regardless of participant order (#114)', async () => {
+    const participants = [
+      { threadId: 't1', userId: 'u1' },
+      { threadId: 't1', userId: 'u2' },
+    ];
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u1' });
+    prismaMock.threadParticipant.findMany.mockResolvedValue(participants);
+    prismaMock.messageThread.findUnique.mockResolvedValue({
+      id: 't1',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      participants: [{ userId: 'u1' }, { userId: 'u2' }],
+    });
+    prismaMock.user.findMany.mockResolvedValue([
+      { id: 'u1', name: 'A', username: 'a' },
+      { id: 'u2', name: 'B', username: 'b' },
+    ]);
+
+    // u2 initiates — reversed order
+    const result = await createOrGetThread('u2', { participantId: 'u1' });
+    expect(result.created).toBe(false);
+    expect(result.thread.id).toBe('t1');
+  });
+
+  it('rejects a thread with the same user as both participants (#115)', async () => {
+    await expect(
+      createOrGetThread('u1', { participantId: 'u1' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+});
+
+describe('thread participant restriction (#116)', () => {
+  it('rejects a non-participant from sending a message in a private thread', async () => {
+    prismaMock.threadParticipant.findUnique.mockResolvedValue(null);
+
+    await expect(markThreadRead('t1', 'outsider')).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+  });
+
+  it('allows a participant to access their thread', async () => {
+    prismaMock.threadParticipant.findUnique.mockResolvedValue({
+      threadId: 't1',
+      userId: 'u1',
+    });
+    prismaMock.message.updateMany.mockResolvedValue({ count: 0 });
+    prismaMock.message.count.mockResolvedValue(0);
+
+    await expect(markThreadRead('t1', 'u1')).resolves.toMatchObject({
+      threadId: 't1',
+    });
+  it('propagates database errors during thread creation without returning a fabricated thread (#118)', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u2' });
+    prismaMock.threadParticipant.findMany.mockResolvedValue([]);
+    prismaMock.messageThread.create.mockRejectedValue(new Error('DB connection lost'));
+
+    await expect(
+      createOrGetThread('u1', { participantId: 'u2' }),
+    ).rejects.toThrow('DB connection lost');
+  });
+
+  it('returns NOT_FOUND when the thread record is missing after creation (#117)', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u2' });
+    prismaMock.threadParticipant.findMany.mockResolvedValue([]);
+    prismaMock.messageThread.create.mockResolvedValue({ id: 't-gone' });
+    // Thread deleted between create and loadThreadView
+    prismaMock.messageThread.findUnique.mockResolvedValue(null);
+
+    await expect(
+      createOrGetThread('u1', { participantId: 'u2' }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
 });
 
 describe('markThreadRead (#840)', () => {

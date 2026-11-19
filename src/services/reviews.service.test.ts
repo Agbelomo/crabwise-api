@@ -38,6 +38,7 @@ import {
   reportReview,
   REVIEW_EDIT_WINDOW_MS,
   REVIEW_REPORTS_PER_DAY,
+  ALLOWED_REPORT_REASONS,
 } from './reviews.service';
 
 beforeEach(() => {
@@ -488,5 +489,126 @@ describe('restrict review edits to the author (#108)', () => {
 
     const result = await editReview('r1', 'author-1', { body: 'Updated' });
     expect(result.edited).toBe(true);
+describe('review average after edits (#109)', () => {
+  it('invalidates the cache and recomputes the average when a review is edited', async () => {
+    const { invalidateNamespace } = await import('@/services/cache.service');
+    const recent = new Date(Date.now() - 1000);
+    prismaMock.review.findUnique.mockResolvedValue({
+      id: 'r1',
+      authorId: 'a1',
+      targetId: 'artist-1',
+      createdAt: recent,
+    });
+    prismaMock.review.update.mockResolvedValue({
+      id: 'r1',
+      authorId: 'a1',
+      targetId: 'artist-1',
+      rating: 3,
+      edited: true,
+    });
+
+    await editReview('r1', 'a1', { rating: 3 });
+
+    expect(invalidateNamespace).toHaveBeenCalledWith('reviews');
+  });
+
+  it('rejects an edit with a rating outside 1–5 after update', async () => {
+    const recent = new Date(Date.now() - 1000);
+    prismaMock.review.findUnique.mockResolvedValue({
+      id: 'r1',
+      authorId: 'a1',
+      targetId: 'artist-1',
+      createdAt: recent,
+    });
+
+    await expect(editReview('r1', 'a1', { rating: 0 })).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+  });
+});
+
+describe('deleted artwork in review queries (#110)', () => {
+  it('returns an empty page with zero summary when the target user no longer exists', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(null);
+
+    const result = await listReviewsForUsername('deleted-user', {
+      page: 1,
+      limit: 20,
+      sort: 'recent',
+    });
+
+    expect(result.data).toHaveLength(0);
+    expect(result.total).toBe(0);
+    expect(result.summary.average).toBe(0);
+  });
+});
+
+describe('review report reason validation (#111)', () => {
+  it('rejects an empty reason', async () => {
+    prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+
+    await expect(reportReview('r1', 'reporter', { reason: '' })).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+  });
+
+  it('rejects an unsupported reason', async () => {
+    prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+
+    await expect(
+      reportReview('r1', 'reporter', { reason: 'just-because' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('accepts all allowed report reasons', async () => {
+    prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+    prismaMock.reviewReport.findUnique.mockResolvedValue(null);
+    prismaMock.reviewReport.count.mockResolvedValue(0);
+    prismaMock.reviewReport.create.mockResolvedValue({
+      id: 'rep1', reviewId: 'r1', reason: 'spam', note: null, createdAt: new Date(),
+    });
+
+    for (const reason of ALLOWED_REPORT_REASONS) {
+      vi.clearAllMocks();
+      prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+      prismaMock.reviewReport.findUnique.mockResolvedValue(null);
+      prismaMock.reviewReport.count.mockResolvedValue(0);
+      prismaMock.reviewReport.create.mockResolvedValue({
+        id: 'rep1', reviewId: 'r1', reason, note: null, createdAt: new Date(),
+      });
+
+      await expect(
+        reportReview('r1', 'reporter', { reason }),
+      ).resolves.toMatchObject({ reason });
+    }
+  });
+});
+
+describe('review reporting idempotency (#112)', () => {
+  it('returns CONFLICT when the same reporter submits the same review a second time', async () => {
+    prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+    prismaMock.reviewReport.findUnique.mockResolvedValue({ id: 'rep-existing' });
+
+    await expect(reportReview('r1', 'reporter', { reason: 'spam' })).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(prismaMock.reviewReport.create).not.toHaveBeenCalled();
+  });
+
+  it('handles a concurrent duplicate report via unique-constraint and returns the same CONFLICT', async () => {
+    const { Prisma } = await import('@prisma/client');
+    prismaMock.review.findUnique.mockResolvedValue({ id: 'r1', authorId: 'author' });
+    prismaMock.reviewReport.findUnique.mockResolvedValue(null);
+    prismaMock.reviewReport.count.mockResolvedValue(0);
+    prismaMock.reviewReport.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint', {
+        code: 'P2002',
+        clientVersion: '6.19.3',
+      }),
+    );
+
+    await expect(reportReview('r1', 'reporter', { reason: 'spam' })).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
   });
 });

@@ -14,6 +14,16 @@ const REPORTS_PER_DAY = 5;
 const AVG_CACHE_TTL_SEC = 300;
 const OPEN_REPORT_STATUSES = ['OPEN', 'REVIEWING'] as const;
 
+/** Accepted values for a review report reason (#111). */
+export const ALLOWED_REPORT_REASONS = [
+  'spam',
+  'inappropriate',
+  'fake',
+  'harassment',
+  'other',
+] as const;
+export type ReportReason = (typeof ALLOWED_REPORT_REASONS)[number];
+
 export type ReviewSort = 'recent' | 'highest' | 'lowest';
 
 export interface ListReviewsQuery {
@@ -169,7 +179,24 @@ export async function listReviewsForUsername(
   username: string,
   query: ListReviewsQuery,
 ): Promise<PaginatedReviews> {
-  const targetId = await getArtistIdByUsername(username);
+  let targetId: string;
+  try {
+    targetId = await getArtistIdByUsername(username);
+  } catch (err) {
+    // If the target user no longer exists (deleted artwork / account), return
+    // a stable empty result rather than propagating NOT_FOUND (#110).
+    if (err instanceof AppError && err.code === 'NOT_FOUND') {
+      return {
+        data: [],
+        page: query.page,
+        limit: query.limit,
+        total: 0,
+        hasNext: false,
+        summary: { average: 0, count: 0, distribution: { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0 } },
+      };
+    }
+    throw err;
+  }
   const where = visibleWhere(targetId);
   const skip = (query.page - 1) * query.limit;
 
@@ -387,6 +414,13 @@ export async function reportReview(
   if (!input.reason?.trim()) {
     throw new AppError('BAD_REQUEST', 'Reason is required');
   }
+  const normalizedReason = input.reason.trim().toLowerCase();
+  if (!(ALLOWED_REPORT_REASONS as readonly string[]).includes(normalizedReason)) {
+    throw new AppError(
+      'BAD_REQUEST',
+      `Reason must be one of: ${ALLOWED_REPORT_REASONS.join(', ')}`,
+    );
+  }
 
   const review = await prisma.review.findUnique({ where: { id: reviewId } });
   if (review === null) {
@@ -421,7 +455,7 @@ export async function reportReview(
       data: {
         reviewId,
         reporterId,
-        reason: input.reason.trim(),
+        reason: normalizedReason,
         note: input.note?.trim() || null,
         status: 'OPEN',
       },
