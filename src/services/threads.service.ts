@@ -26,10 +26,15 @@ export interface ThreadView {
 
 /**
  * Find an existing 1:1 thread between two users, if any.
+ * Participant order is normalised so (A, B) and (B, A) resolve to the same
+ * thread (#114).
  */
 export async function findThreadBetween(userA: string, userB: string): Promise<ThreadView | null> {
+  // Normalise order so the lookup is symmetric regardless of which user is
+  // passed first (#114).
+  const [first, second] = [userA, userB].sort();
   const rows = await prisma.threadParticipant.findMany({
-    where: { userId: { in: [userA, userB] } },
+    where: { userId: { in: [first, second] } },
     select: { threadId: true, userId: true },
   });
 
@@ -83,6 +88,8 @@ async function loadThreadView(threadId: string): Promise<ThreadView> {
 /**
  * Create a thread between the authenticated user and participantId.
  * Returns the existing thread if the pair already has one (#837).
+ * Under concurrency, a unique-constraint violation is recovered by looking
+ * up the now-existing thread rather than propagating the error (#113).
  */
 export async function createOrGetThread(
   currentUserId: string,
@@ -92,6 +99,7 @@ export async function createOrGetThread(
   if (!otherId) {
     throw new AppError('BAD_REQUEST', 'participantId is required');
   }
+  // Reject threads where both participants are the same user (#115).
   if (otherId === currentUserId) {
     throw new AppError('BAD_REQUEST', 'Cannot create a thread with yourself');
   }
@@ -106,16 +114,30 @@ export async function createOrGetThread(
     return { thread: existing, created: false };
   }
 
-  const thread = await prisma.messageThread.create({
-    data: {
-      participants: {
-        create: [{ userId: currentUserId }, { userId: otherId }],
+  try {
+    const thread = await prisma.messageThread.create({
+      data: {
+        participants: {
+          create: [{ userId: currentUserId }, { userId: otherId }],
+        },
       },
-    },
-  });
+    });
 
-  const view = await loadThreadView(thread.id);
-  return { thread: view, created: true };
+    const view = await loadThreadView(thread.id);
+    return { thread: view, created: true };
+  } catch (err: unknown) {
+    // Under concurrency a second concurrent request for the same pair will
+    // hit the unique constraint — recover by returning the existing thread
+    // rather than surfacing a database error (#113).
+    const code = (err as { code?: string })?.code;
+    if (code === 'P2002') {
+      const recovered = await findThreadBetween(currentUserId, otherId);
+      if (recovered) {
+        return { thread: recovered, created: false };
+      }
+    }
+    throw err;
+  }
 }
 
 export const MESSAGE_MAX_LENGTH = 5000;
