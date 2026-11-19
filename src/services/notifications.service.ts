@@ -31,6 +31,9 @@ export interface CreateNotificationInput {
   readonly userId: string;
   readonly type: NotificationType;
   readonly data?: Record<string, unknown>;
+  /** Optional idempotency key — repeated calls with the same key return the
+   * existing notification without creating a duplicate (#119). */
+  readonly eventKey?: string;
 }
 
 export interface PublicNotification {
@@ -81,13 +84,27 @@ async function invalidateUnreadCount(userId: string): Promise<void> {
  * Creates a single notification for one user (#841). When SMTP is fully
  * configured, an email job is enqueued after the row is committed so the
  * request path never waits on delivery.
+ *
+ * When `eventKey` is supplied, duplicate calls with the same key for the
+ * same user return the existing notification instead of creating a new row
+ * (#119).
  */
 export async function createNotification(input: CreateNotificationInput): Promise<Notification> {
+  if (input.eventKey) {
+    const existing = await prisma.notification.findFirst({
+      where: { userId: input.userId, eventKey: input.eventKey },
+    });
+    if (existing !== null) {
+      return existing;
+    }
+  }
+
   const notification = await prisma.notification.create({
     data: {
       userId: input.userId,
       type: input.type,
       data: (input.data ?? undefined) as Prisma.InputJsonValue | undefined,
+      ...(input.eventKey ? { eventKey: input.eventKey } : {}),
     },
   });
   await invalidateUnreadCount(input.userId);

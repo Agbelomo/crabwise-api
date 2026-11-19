@@ -90,6 +90,7 @@ async function loadThreadView(threadId: string): Promise<ThreadView> {
  * Returns the existing thread if the pair already has one (#837).
  * Under concurrency, a unique-constraint violation is recovered by looking
  * up the now-existing thread rather than propagating the error (#113).
+ * Persistence errors are propagated rather than silenced (#118).
  */
 export async function createOrGetThread(
   currentUserId: string,
@@ -120,6 +121,12 @@ export async function createOrGetThread(
         participants: {
           create: [{ userId: currentUserId }, { userId: otherId }],
         },
+  // Persistence errors propagate; callers must not receive a fabricated
+  // thread when the row was never committed (#118).
+  const thread = await prisma.messageThread.create({
+    data: {
+      participants: {
+        create: [{ userId: currentUserId }, { userId: otherId }],
       },
     });
 
