@@ -320,6 +320,10 @@ export async function createReview(
   if (input.orderId && input.commissionId) {
     throw new AppError('BAD_REQUEST', 'Provide either orderId or commissionId, not both');
   }
+  // Prevent an artwork owner from reviewing their own listing (#107).
+  if (authorId === input.targetId) {
+    throw new AppError('FORBIDDEN', 'You cannot review your own listing');
+  }
 
   if (input.orderId !== undefined) {
     await assertOrderReviewable(authorId, input.orderId, input.targetId);
