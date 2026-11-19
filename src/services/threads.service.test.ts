@@ -71,6 +71,28 @@ describe('createOrGetThread (#837)', () => {
     expect(result.created).toBe(true);
     expect(result.thread.id).toBe('t-new');
   });
+
+  it('propagates database errors during thread creation without returning a fabricated thread (#118)', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u2' });
+    prismaMock.threadParticipant.findMany.mockResolvedValue([]);
+    prismaMock.messageThread.create.mockRejectedValue(new Error('DB connection lost'));
+
+    await expect(
+      createOrGetThread('u1', { participantId: 'u2' }),
+    ).rejects.toThrow('DB connection lost');
+  });
+
+  it('returns NOT_FOUND when the thread record is missing after creation (#117)', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ id: 'u2' });
+    prismaMock.threadParticipant.findMany.mockResolvedValue([]);
+    prismaMock.messageThread.create.mockResolvedValue({ id: 't-gone' });
+    // Thread deleted between create and loadThreadView
+    prismaMock.messageThread.findUnique.mockResolvedValue(null);
+
+    await expect(
+      createOrGetThread('u1', { participantId: 'u2' }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
 });
 
 describe('markThreadRead (#840)', () => {

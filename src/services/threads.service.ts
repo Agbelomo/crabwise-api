@@ -83,6 +83,7 @@ async function loadThreadView(threadId: string): Promise<ThreadView> {
 /**
  * Create a thread between the authenticated user and participantId.
  * Returns the existing thread if the pair already has one (#837).
+ * Persistence errors are propagated rather than silenced (#118).
  */
 export async function createOrGetThread(
   currentUserId: string,
@@ -106,6 +107,8 @@ export async function createOrGetThread(
     return { thread: existing, created: false };
   }
 
+  // Persistence errors propagate; callers must not receive a fabricated
+  // thread when the row was never committed (#118).
   const thread = await prisma.messageThread.create({
     data: {
       participants: {
