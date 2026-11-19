@@ -313,3 +313,180 @@ describe('moderateReport (#836)', () => {
     expect(updated.status).toBe('RESOLVED');
   });
 });
+
+describe('prevent duplicate reviews for the same purchase (#105)', () => {
+  it('maps a P2002 unique violation to a CONFLICT error', async () => {
+    prismaMock.order.findUnique.mockResolvedValue({
+      buyerId: BUYER_ID,
+      sellerId: ARTIST_ID,
+      status: 'COMPLETED',
+    });
+    prismaMock.review.create.mockRejectedValue({ code: 'P2002' });
+
+    await expect(
+      createReview(BUYER_ID, {
+        orderId: ORDER_ID,
+        targetId: ARTIST_ID,
+        rating: 5,
+        body: 'Great work',
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
+  it('allows a first review to be created normally', async () => {
+    prismaMock.order.findUnique.mockResolvedValue({
+      buyerId: BUYER_ID,
+      sellerId: ARTIST_ID,
+      status: 'COMPLETED',
+    });
+    prismaMock.review.create.mockResolvedValue({
+      id: 'r-new',
+      authorId: BUYER_ID,
+      targetId: ARTIST_ID,
+      orderId: ORDER_ID,
+      rating: 4,
+      body: 'Good',
+      title: null,
+      edited: false,
+      createdAt: new Date(),
+    });
+    prismaMock.review.groupBy.mockResolvedValue([{ rating: 4, _count: { rating: 1 } }]);
+
+    const { review } = await createReview(BUYER_ID, {
+      orderId: ORDER_ID,
+      targetId: ARTIST_ID,
+      rating: 4,
+      body: 'Good',
+    });
+
+    expect(review.id).toBe('r-new');
+  });
+});
+
+describe('validate review rating bounds (#106)', () => {
+  it('accepts the minimum rating of 1', async () => {
+    prismaMock.order.findUnique.mockResolvedValue({
+      buyerId: BUYER_ID,
+      sellerId: ARTIST_ID,
+      status: 'COMPLETED',
+    });
+    prismaMock.review.create.mockResolvedValue({
+      id: 'r1',
+      authorId: BUYER_ID,
+      targetId: ARTIST_ID,
+      orderId: ORDER_ID,
+      rating: 1,
+      body: 'Meh',
+      title: null,
+      edited: false,
+      createdAt: new Date(),
+    });
+    prismaMock.review.groupBy.mockResolvedValue([{ rating: 1, _count: { rating: 1 } }]);
+
+    const { review } = await createReview(BUYER_ID, {
+      orderId: ORDER_ID,
+      targetId: ARTIST_ID,
+      rating: 1,
+      body: 'Meh',
+    });
+    expect(review.rating).toBe(1);
+  });
+
+  it('accepts the maximum rating of 5', async () => {
+    prismaMock.order.findUnique.mockResolvedValue({
+      buyerId: BUYER_ID,
+      sellerId: ARTIST_ID,
+      status: 'COMPLETED',
+    });
+    prismaMock.review.create.mockResolvedValue({
+      id: 'r5',
+      authorId: BUYER_ID,
+      targetId: ARTIST_ID,
+      orderId: ORDER_ID,
+      rating: 5,
+      body: 'Perfect',
+      title: null,
+      edited: false,
+      createdAt: new Date(),
+    });
+    prismaMock.review.groupBy.mockResolvedValue([{ rating: 5, _count: { rating: 1 } }]);
+
+    const { review } = await createReview(BUYER_ID, {
+      orderId: ORDER_ID,
+      targetId: ARTIST_ID,
+      rating: 5,
+      body: 'Perfect',
+    });
+    expect(review.rating).toBe(5);
+  });
+
+  it('rejects rating 0 (below minimum)', async () => {
+    await expect(
+      createReview(BUYER_ID, { orderId: ORDER_ID, targetId: ARTIST_ID, rating: 0, body: 'x' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('rejects rating 6 (above maximum)', async () => {
+    await expect(
+      createReview(BUYER_ID, { orderId: ORDER_ID, targetId: ARTIST_ID, rating: 6, body: 'x' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+
+  it('rejects a non-integer rating', async () => {
+    await expect(
+      createReview(BUYER_ID, { orderId: ORDER_ID, targetId: ARTIST_ID, rating: 3.5, body: 'x' }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+  });
+});
+
+describe('prevent self-review (#107)', () => {
+  it('rejects a review where the author is the same as the target', async () => {
+    await expect(
+      createReview(ARTIST_ID, {
+        orderId: ORDER_ID,
+        targetId: ARTIST_ID,
+        rating: 5,
+        body: 'Self praise',
+      }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(prismaMock.review.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('restrict review edits to the author (#108)', () => {
+  it('rejects an edit attempt from a different user', async () => {
+    const recent = new Date(Date.now() - 1000);
+    prismaMock.review.findUnique.mockResolvedValue({
+      id: 'r1',
+      authorId: 'original-author',
+      createdAt: recent,
+    });
+
+    await expect(editReview('r1', 'different-user', { body: 'hijacked' })).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    expect(prismaMock.review.update).not.toHaveBeenCalled();
+  });
+
+  it('allows the author to edit their own review within the window', async () => {
+    const recent = new Date(Date.now() - 1000);
+    prismaMock.review.findUnique.mockResolvedValue({
+      id: 'r1',
+      authorId: 'author-1',
+      targetId: ARTIST_ID,
+      createdAt: recent,
+    });
+    prismaMock.review.update.mockResolvedValue({
+      id: 'r1',
+      authorId: 'author-1',
+      targetId: ARTIST_ID,
+      rating: 4,
+      body: 'Updated',
+      edited: true,
+      createdAt: recent,
+    });
+
+    const result = await editReview('r1', 'author-1', { body: 'Updated' });
+    expect(result.edited).toBe(true);
+  });
+});
