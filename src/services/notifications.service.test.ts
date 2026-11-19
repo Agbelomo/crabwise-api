@@ -6,6 +6,7 @@ const { prismaMock, redisMock, envMock, enqueueEmailMock } = vi.hoisted(() => {
     createMany: vi.fn(),
     findMany: vi.fn(),
     findUnique: vi.fn(),
+    findFirst: vi.fn(),
     update: vi.fn(),
     updateMany: vi.fn(),
     count: vi.fn(),
@@ -54,6 +55,7 @@ beforeEach(() => {
   envMock.smtp = undefined;
   redisMock.del.mockResolvedValue(0);
   enqueueEmailMock.mockResolvedValue(undefined);
+  prismaMock.notification.findFirst.mockResolvedValue(null);
 });
 
 describe('createNotification (#841)', () => {
@@ -226,5 +228,69 @@ describe('getUnreadCount (#842)', () => {
 
     await expect(getUnreadCount(USER_ID)).resolves.toBe(9);
     expect(redisMock.set).toHaveBeenCalledWith(`notifications:unread:${USER_ID}`, '9', 'EX', 60);
+  });
+});
+
+describe('createNotification idempotency by eventKey (#119)', () => {
+  it('returns the existing notification without creating a duplicate when the same eventKey is used', async () => {
+    const existing = makeNotification({ id: 'notif-existing', eventKey: 'evt-abc' });
+    prismaMock.notification.findFirst.mockResolvedValue(existing);
+
+    const result = await createNotification({
+      userId: USER_ID,
+      type: 'ORDER_UPDATE',
+      eventKey: 'evt-abc',
+    });
+
+    expect(result.id).toBe('notif-existing');
+    expect(prismaMock.notification.create).not.toHaveBeenCalled();
+  });
+
+  it('creates a new notification when no matching eventKey exists', async () => {
+    prismaMock.notification.findFirst.mockResolvedValue(null);
+    prismaMock.notification.create.mockResolvedValue(makeNotification({ eventKey: 'evt-new' }));
+
+    const result = await createNotification({
+      userId: USER_ID,
+      type: 'ORDER_UPDATE',
+      eventKey: 'evt-new',
+    });
+
+    expect(prismaMock.notification.create).toHaveBeenCalled();
+    expect(result.id).toBe('notif-1');
+  });
+
+  it('skips the deduplication lookup when no eventKey is supplied', async () => {
+    prismaMock.notification.create.mockResolvedValue(makeNotification());
+
+    await createNotification({ userId: USER_ID, type: 'ORDER_UPDATE' });
+
+    expect(prismaMock.notification.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.notification.create).toHaveBeenCalled();
+  });
+});
+
+describe('markNotificationRead recipient ownership (#120)', () => {
+  it("rejects access to another user's notification with NOT_FOUND", async () => {
+    prismaMock.notification.findUnique.mockResolvedValue(
+      makeNotification({ userId: 'other-user' }),
+    );
+
+    await expect(markNotificationRead(USER_ID, 'notif-1')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(prismaMock.notification.update).not.toHaveBeenCalled();
+  });
+
+  it('allows the owner to mark their own notification read', async () => {
+    prismaMock.notification.findUnique.mockResolvedValue(makeNotification());
+    prismaMock.notification.update.mockResolvedValue(
+      makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
+    );
+
+    const result = await markNotificationRead(USER_ID, 'notif-1');
+
+    expect(result.readAt).not.toBeNull();
+    expect(prismaMock.notification.update).toHaveBeenCalled();
   });
 });
