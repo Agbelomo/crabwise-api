@@ -100,6 +100,26 @@ function assertNoteLength(note: string): void {
 }
 
 /**
+ * Verifies that a user is either a participant in the commission (client or artist)
+ * or an admin, throwing an error if they are unauthorized.
+ */
+export async function verifyDeliverableAccess(commissionId: string, userId: string, isAdmin = false): Promise<void> {
+  if (isAdmin) {
+    return;
+  }
+  const commission = await prisma.commission.findUnique({
+    where: { id: commissionId },
+    select: { clientId: true, artistId: true },
+  });
+  if (commission === null) {
+    throw new AppError('NOT_FOUND', 'Commission not found');
+  }
+  if (commission.clientId !== userId && commission.artistId !== userId) {
+    throw new AppError('FORBIDDEN', 'You do not have access to deliverables for this commission');
+  }
+}
+
+/**
  * The artist on a commission submits a WIP draft or the final artefact.
  *
  * Only the assigned artist may submit (#784), only while the commission is
