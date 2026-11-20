@@ -145,6 +145,9 @@ export async function submitDeliverable(
     );
   }
 
+  // Keep the deliverable, nested media links and submission side effects in
+  // one transaction. Let failures escape the callback so Prisma rolls back
+  // every write, including links created before a later attachment fails.
   return prisma.$transaction(async (tx) => {
     const commission = await tx.commission.findUnique({ where: { id: commissionId } });
     if (commission === null) {
