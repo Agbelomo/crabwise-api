@@ -174,6 +174,75 @@ describe('submitDeliverable (#784)', () => {
     );
   });
 
+  describe.each(['WIP', 'FINAL'] as const)('%s submission transaction', (type) => {
+    it.each([
+      ['media attachment', 'deliverable'],
+      ['commission transition', 'commission'],
+      ['audit event', 'commissionEvent'],
+      ['client notification', 'notification'],
+    ] as const)('rejects the transaction when %s fails', async (_stage, model) => {
+      txMock.commission.findUnique.mockResolvedValue(makeCommission('ACCEPTED'));
+      txMock.media.findMany.mockResolvedValue([{ id: 'media-1' }, { id: 'media-2' }]);
+      const failure = new Error(`Failed to write ${model}`);
+      const writes = [
+        txMock.deliverable.create,
+        txMock.commission.update,
+        txMock.commissionEvent.create,
+        txMock.notification.create,
+      ];
+      const failingWrite = model === 'commission' ? txMock.commission.update : txMock[model].create;
+      failingWrite.mockRejectedValueOnce(failure);
+
+      await expect(
+        submitDeliverable(COMMISSION_ID, ARTIST_ID, {
+          type,
+          mediaIds: ['media-1', 'media-2'],
+        }),
+      ).rejects.toBe(failure);
+
+      expect(prismaMock.$transaction).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      // Rejecting the callback is what tells Prisma to roll back. Merely
+      // rejecting outside it (after committing partial writes) is too late.
+      await expect(prismaMock.$transaction.mock.results[0]!.value).rejects.toBe(failure);
+      expect(txMock.deliverable.create).toHaveBeenCalledWith({
+        data: {
+          commissionId: COMMISSION_ID,
+          type,
+          status: 'SUBMITTED',
+          note: null,
+          media: {
+            create: [
+              { mediaId: 'media-1', sort: 0 },
+              { mediaId: 'media-2', sort: 1 },
+            ],
+          },
+        },
+        include: { media: true },
+      });
+      for (const write of writes.slice(0, writes.indexOf(failingWrite) + 1)) {
+        expect(write).toHaveBeenCalledTimes(1);
+      }
+      for (const write of writes.slice(writes.indexOf(failingWrite) + 1)) {
+        expect(write).not.toHaveBeenCalled();
+      }
+    });
+
+    it('propagates a transaction commit failure instead of reporting success', async () => {
+      const failure = new Error('Transaction commit failed');
+      prismaMock.$transaction.mockImplementationOnce(async (callback) => {
+        await callback(txMock);
+        throw failure;
+      });
+
+      await expect(
+        submitDeliverable(COMMISSION_ID, ARTIST_ID, { type, mediaIds: ['media-1'] }),
+      ).rejects.toBe(failure);
+
+      expect(txMock.deliverable.create).toHaveBeenCalledTimes(1);
+      expect(txMock.notification.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('de-duplicates media ids before attaching them', async () => {
     await submitDeliverable(COMMISSION_ID, ARTIST_ID, {
       type: 'FINAL',
