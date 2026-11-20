@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const CLIENT_ID = 'client-1';
 const ARTIST_ID = 'artist-1';
 const COMMISSION_ID = 'commission-1';
+const UNRELATED_USER_ID = 'user-unrelated';
 
 const { prismaMock, txMock } = vi.hoisted(() => {
   const tx = {
@@ -23,7 +24,9 @@ const { prismaMock, txMock } = vi.hoisted(() => {
     prismaMock: {
       // Typed loosely so `tx` isn't referenced in its own annotation.
       $transaction: vi.fn(async (callback: (client: unknown) => Promise<unknown>) => callback(tx)),
-      tx,
+      commission: {
+        findUnique: vi.fn(),
+      },
     },
   };
 });
@@ -34,6 +37,7 @@ import {
   DELIVERABLE_MAX_MEDIA,
   reviewDeliverable,
   submitDeliverable,
+  verifyDeliverableAccess,
 } from './deliverables.service';
 
 const DELIVERABLE_ID = 'deliverable-1';
@@ -84,6 +88,37 @@ beforeEach(() => {
   txMock.deliverable.count.mockResolvedValue(0);
   // No open dispute unless a test asks for one.
   txMock.commissionDispute.findFirst.mockResolvedValue(null);
+  prismaMock.commission.findUnique.mockResolvedValue(makeCommission());
+});
+
+describe('verifyDeliverableAccess (#99)', () => {
+  it('allows the client to read deliverables', async () => {
+    await expect(verifyDeliverableAccess(COMMISSION_ID, CLIENT_ID)).resolves.toBeUndefined();
+  });
+
+  it('allows the artist to read deliverables', async () => {
+    await expect(verifyDeliverableAccess(COMMISSION_ID, ARTIST_ID)).resolves.toBeUndefined();
+  });
+
+  it('allows an admin to read deliverables', async () => {
+    await expect(verifyDeliverableAccess(COMMISSION_ID, UNRELATED_USER_ID, true)).resolves.toBeUndefined();
+  });
+
+  it('rejects unrelated users from reading deliverables', async () => {
+    prismaMock.commission.findUnique.mockResolvedValue(makeCommission());
+
+    await expect(verifyDeliverableAccess(COMMISSION_ID, UNRELATED_USER_ID)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+  });
+
+  it('throws NOT_FOUND if the commission does not exist during access verification', async () => {
+    prismaMock.commission.findUnique.mockResolvedValue(null);
+
+    await expect(verifyDeliverableAccess(COMMISSION_ID, UNRELATED_USER_ID)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+  });
 });
 
 describe('submitDeliverable (#784)', () => {
@@ -169,7 +204,7 @@ describe('submitDeliverable (#784)', () => {
               { mediaId: 'media-2', sort: 1 },
             ],
           },
-        }),
+        },
       }),
     );
   });
@@ -213,7 +248,7 @@ describe('submitDeliverable (#784)', () => {
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it.each(['PENDING', 'DELIVERED', 'COMPLETED', 'CANCELLED'])(
+  it.each(['PENDING', 'DELIVERED', 'COMPLETED', 'CANCELLED'](
     'rejects a submission while the commission is %s',
     async (status) => {
       txMock.commission.findUnique.mockResolvedValue(makeCommission(status));
