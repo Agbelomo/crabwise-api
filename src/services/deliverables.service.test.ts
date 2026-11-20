@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const CLIENT_ID = 'client-1';
@@ -32,6 +33,8 @@ const { prismaMock, txMock } = vi.hoisted(() => {
 });
 
 vi.mock('@/services', () => ({ prisma: prismaMock }));
+
+import { AppError } from '@/middlewares';
 
 import {
   DELIVERABLE_MAX_MEDIA,
@@ -240,12 +243,60 @@ describe('submitDeliverable (#784)', () => {
     expect(txMock.deliverable.create).not.toHaveBeenCalled();
   });
 
-  it('rejects an unknown commission', async () => {
-    txMock.commission.findUnique.mockResolvedValue(null);
+  it('rejects an unknown commission before checking media or writing anything', async () => {
+    txMock.commission.findUnique.mockResolvedValueOnce(null);
+
+    const result = submitDeliverable(COMMISSION_ID, ARTIST_ID, {
+      type: 'FINAL',
+      mediaIds: ['media-1'],
+    });
+
+    await expect(result).rejects.toBeInstanceOf(AppError);
+    await expect(result).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'Commission not found',
+    });
+    expect(txMock.media.findMany).not.toHaveBeenCalled();
+    expect(txMock.deliverable.create).not.toHaveBeenCalled();
+    expect(txMock.commission.update).not.toHaveBeenCalled();
+    expect(txMock.commissionEvent.create).not.toHaveBeenCalled();
+    expect(txMock.notification.create).not.toHaveBeenCalled();
+  });
+
+  it('returns a domain error when the commission is deleted before the insert', async () => {
+    txMock.deliverable.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('Foreign key constraint violated', {
+        code: 'P2003',
+        clientVersion: Prisma.prismaVersion.client,
+        meta: { modelName: 'Deliverable', constraint: 'Deliverable_commissionId_fkey' },
+      }),
+    );
+
+    const result = submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL' });
+
+    await expect(result).rejects.toBeInstanceOf(AppError);
+    await expect(result).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'Commission not found',
+    });
+    expect(txMock.commission.update).not.toHaveBeenCalled();
+    expect(txMock.commissionEvent.create).not.toHaveBeenCalled();
+    expect(txMock.notification.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    new Prisma.PrismaClientKnownRequestError('Foreign key constraint violated', {
+      code: 'P2003',
+      clientVersion: Prisma.prismaVersion.client,
+      meta: { modelName: 'Deliverable', constraint: 'DeliverableMedia_mediaId_fkey' },
+    }),
+    new Error('Database connection lost'),
+  ])('propagates an unrelated insert failure: %s', async (error) => {
+    txMock.deliverable.create.mockRejectedValueOnce(error);
 
     await expect(
-      submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL' }),
-    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL', mediaIds: ['media-1'] }),
+    ).rejects.toBe(error);
   });
 
   it.each(['PENDING', 'DELIVERED', 'COMPLETED', 'CANCELLED'](

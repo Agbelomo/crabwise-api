@@ -25,8 +25,8 @@ import type {
   Deliverable,
   DeliverableStatus,
   DeliverableType,
-  Prisma,
 } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 import { env } from '@/config';
 import { AppError } from '@/middlewares';
@@ -170,19 +170,31 @@ export async function submitDeliverable(
       }
     }
 
-    const deliverable = await tx.deliverable.create({
-      data: {
-        commissionId,
-        type: input.type,
-        note: note === '' ? null : note,
-        // The artist is submitting this version, not merely uploading it.
-        status: 'SUBMITTED',
-        ...(mediaIds.length > 0
-          ? { media: { create: mediaIds.map((mediaId, sort) => ({ mediaId, sort })) } }
-          : {}),
-      },
-      include: { media: true },
-    });
+    const deliverable = await tx.deliverable
+      .create({
+        data: {
+          commissionId,
+          type: input.type,
+          note: note === '' ? null : note,
+          // The artist is submitting this version, not merely uploading it.
+          status: 'SUBMITTED',
+          ...(mediaIds.length > 0
+            ? { media: { create: mediaIds.map((mediaId, sort) => ({ mediaId, sort })) } }
+            : {}),
+        },
+        include: { media: true },
+      })
+      .catch((error: unknown) => {
+        // The commission can be deleted between the lookup and the insert.
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2003' &&
+          error.meta?.constraint === 'Deliverable_commissionId_fkey'
+        ) {
+          throw new AppError('NOT_FOUND', 'Commission not found');
+        }
+        throw error;
+      });
 
     const toStatus: CommissionStatus = input.type === 'FINAL' ? 'DELIVERED' : 'IN_PROGRESS';
     let commissionStatus = commission.status;
