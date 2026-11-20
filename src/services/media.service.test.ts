@@ -3,12 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const MEDIA_ID = 'media-1';
 const USER_ID = 'user-1';
 
-const { prismaMock, envMock, enqueueMock, objectExistsMock, s3UploadMock, s3DownloadMock } = vi.hoisted(() => ({
+const { prismaMock, envMock, enqueueMock, objectExistsMock, s3UploadMock, s3DownloadMock, s3DeleteMock } = vi.hoisted(() => ({
   prismaMock: {
     media: {
       findUnique: vi.fn(),
       findMany: vi.fn(),
       create: vi.fn(),
+      deleteMany: vi.fn(),
     },
     artworkMedia: { create: vi.fn() },
     portfolioMedia: { create: vi.fn() },
@@ -24,6 +25,7 @@ const { prismaMock, envMock, enqueueMock, objectExistsMock, s3UploadMock, s3Down
   objectExistsMock: vi.fn(),
   s3UploadMock: vi.fn(),
   s3DownloadMock: vi.fn(),
+  s3DeleteMock: vi.fn(),
 }));
 
 vi.mock('@/config', () => ({ env: envMock }));
