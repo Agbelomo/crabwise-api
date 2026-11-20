@@ -3,11 +3,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const MEDIA_ID = 'media-1';
 const USER_ID = 'user-1';
 
-const { prismaMock, envMock, enqueueMock, objectExistsMock } = vi.hoisted(() => ({
+const { prismaMock, envMock, enqueueMock, objectExistsMock, s3UploadMock, s3DownloadMock } = vi.hoisted(() => ({
   prismaMock: {
     media: {
       findUnique: vi.fn(),
       findMany: vi.fn(),
+      create: vi.fn(),
     },
     artworkMedia: { create: vi.fn() },
     portfolioMedia: { create: vi.fn() },
@@ -17,22 +18,42 @@ const { prismaMock, envMock, enqueueMock, objectExistsMock } = vi.hoisted(() => 
     s3Region: 'us-east-1',
     isProduction: false,
     verifyS3Upload: undefined as boolean | undefined,
+    redisUrl: 'redis://localhost:6379',
   },
   enqueueMock: vi.fn(),
   objectExistsMock: vi.fn(),
+  s3UploadMock: vi.fn(),
+  s3DownloadMock: vi.fn(),
 }));
 
 vi.mock('@/config', () => ({ env: envMock }));
 vi.mock('@/services', () => ({ prisma: prismaMock }));
 vi.mock('@/queues', () => ({ enqueueImageProcessing: enqueueMock }));
 vi.mock('./s3.service', () => ({
-  buildObjectKey: vi.fn(),
+  buildObjectKey: vi.fn(
+    (userId: string, folder: string, name: string) => `${folder}/${userId}/${name}`,
+  ),
   buildPublicUrl: vi.fn((key: string) => `https://cdn/${key}`),
   createPresignedUploadUrl: vi.fn(),
   objectExists: objectExistsMock,
+  downloadObjectBuffer: s3DownloadMock,
+  uploadObjectBuffer: s3UploadMock,
+}));
+vi.mock('sharp', () => ({
+  default: vi.fn(() => ({
+    resize: vi.fn().mockReturnThis(),
+    webp: vi.fn().mockReturnThis(),
+    toBuffer: vi.fn().mockResolvedValue({
+      data: Buffer.from('thumb'),
+      info: { width: 300, height: 200 },
+    }),
+  })),
 }));
 
 import { confirmMediaUpload } from './media.service';
+import { processImage } from '../workers/media.worker';
+import type { Job } from 'bullmq';
+import type { ImageProcessingJobData } from '../queues/media.queue';
 
 function makeMedia(overrides: Record<string, unknown> = {}) {
   return {
@@ -51,14 +72,26 @@ function makeMedia(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeJob(): Job<ImageProcessingJobData> {
+  return {
+    id: 'job-1',
+    data: { mediaId: MEDIA_ID },
+    attemptsMade: 0,
+    attemptsStarted: 0,
+  } as unknown as Job<ImageProcessingJobData>;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   envMock.isProduction = false;
   envMock.verifyS3Upload = undefined;
   prismaMock.media.findUnique.mockResolvedValue(makeMedia());
   prismaMock.media.findMany.mockResolvedValue([]);
+  prismaMock.media.create.mockResolvedValue({});
   enqueueMock.mockResolvedValue(undefined);
   objectExistsMock.mockResolvedValue(true);
+  s3DownloadMock.mockResolvedValue(Buffer.from('original-image'));
+  s3UploadMock.mockResolvedValue(undefined);
 });
 
 describe('confirmMediaUpload S3 verification (#873)', () => {
@@ -121,5 +154,53 @@ describe('confirmMediaUpload S3 verification (#873)', () => {
       code: 'FORBIDDEN',
     });
     expect(enqueueMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('media worker failure surfacing (#97)', () => {
+  it('re-throws so BullMQ marks the job failed when the original download fails', async () => {
+    s3DownloadMock.mockRejectedValue(new Error('S3 download failed'));
+
+    await expect(processImage(makeJob())).rejects.toThrow('S3 download failed');
+  });
+
+  it('re-throws when sharp conversion fails', async () => {
+    const sharpMock = (await import('sharp')).default as unknown as ReturnType<typeof vi.fn>;
+    sharpMock.mockImplementation(() => {
+      throw new Error('sharp: unsupported image format');
+    });
+
+    await expect(processImage(makeJob())).rejects.toThrow('sharp: unsupported image format');
+  });
+
+  it('re-throws when variant persistence (prisma.media.create) fails', async () => {
+    prismaMock.media.create.mockRejectedValue(new Error('prisma write failed'));
+
+    await expect(processImage(makeJob())).rejects.toThrow('prisma write failed');
+  });
+
+  it('re-throws when the S3 variant upload fails', async () => {
+    s3UploadMock.mockRejectedValue(new Error('S3 upload failed'));
+
+    await expect(processImage(makeJob())).rejects.toThrow('S3 upload failed');
+  });
+
+  it('does not throw when the media row is missing (skips gracefully)', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(null);
+
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+  });
+
+  it('does not throw for non-image media (skips gracefully)', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(makeMedia({ type: 'DIGITAL_FILE' }));
+
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+  });
+
+  it('completes without throwing on the happy path', async () => {
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+
+    // Both variants created: thumbnail + webp.
+    expect(prismaMock.media.create).toHaveBeenCalledTimes(2);
   });
 });
