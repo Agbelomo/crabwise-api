@@ -28,6 +28,7 @@ vi.mock('./redis.service', () => ({ tryGetRedisClient: () => redisMock }));
 vi.mock('@/queues', () => ({ enqueueNotificationEmail: enqueueEmailMock }));
 
 import {
+  MAX_NOTIFICATIONS_PAGE_SIZE,
   createNotification,
   createNotifications,
   getUnreadCount,
@@ -170,9 +171,7 @@ describe('markNotificationRead (#842)', () => {
   it('stamps readAt and invalidates the unread cache', async () => {
     prismaMock.notification.findUnique
       .mockResolvedValueOnce(makeNotification({ readAt: null }))
-      .mockResolvedValueOnce(
-        makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
-      );
+      .mockResolvedValueOnce(makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }));
     prismaMock.notification.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await markNotificationRead(USER_ID, 'notif-1');
@@ -231,9 +230,7 @@ describe('getUnreadCount (#842)', () => {
   });
 
   it('serves envelope-cached unread counts', async () => {
-    redisMock.get.mockResolvedValue(
-      JSON.stringify({ v: 7, exp: Date.now() + 60_000 }),
-    );
+    redisMock.get.mockResolvedValue(JSON.stringify({ v: 7, exp: Date.now() + 60_000 }));
 
     await expect(getUnreadCount(USER_ID)).resolves.toBe(7);
     expect(prismaMock.notification.count).not.toHaveBeenCalled();
@@ -308,9 +305,7 @@ describe('markNotificationRead recipient ownership (#120)', () => {
   it('allows the owner to mark their own notification read', async () => {
     prismaMock.notification.findUnique
       .mockResolvedValueOnce(makeNotification({ readAt: null }))
-      .mockResolvedValueOnce(
-        makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
-      );
+      .mockResolvedValueOnce(makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }));
     prismaMock.notification.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await markNotificationRead(USER_ID, 'notif-1');
@@ -319,7 +314,6 @@ describe('markNotificationRead recipient ownership (#120)', () => {
     expect(prismaMock.notification.updateMany).toHaveBeenCalled();
   });
 });
-
 
 describe('listNotifications ordering (#123)', () => {
   it('orders by createdAt desc then id desc for stable pagination', async () => {
@@ -337,12 +331,72 @@ describe('listNotifications ordering (#123)', () => {
   });
 });
 
+describe('listNotifications pagination validation (#122)', () => {
+  beforeEach(() => {
+    prismaMock.notification.findMany.mockResolvedValue([]);
+    prismaMock.notification.count.mockResolvedValue(0);
+    redisMock.get.mockResolvedValue('0');
+  });
+
+  it.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['unsafe integer', Number.MAX_SAFE_INTEGER + 1],
+  ])('rejects a %s page without querying', async (_label, page) => {
+    await expect(listNotifications(USER_ID, { page, limit: 20 })).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+      statusCode: 400,
+    });
+    expect(prismaMock.notification.findMany).not.toHaveBeenCalled();
+    expect(prismaMock.notification.count).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zero', 0],
+    ['negative', -5],
+    ['fractional', 10.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['above the cap', MAX_NOTIFICATIONS_PAGE_SIZE + 1],
+    ['huge', 1_000_000],
+  ])('rejects a %s limit without returning unbounded data', async (_label, limit) => {
+    await expect(listNotifications(USER_ID, { page: 1, limit })).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+    expect(prismaMock.notification.findMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects a page whose offset would overflow a safe integer', async () => {
+    await expect(
+      listNotifications(USER_ID, { page: Number.MAX_SAFE_INTEGER, limit: 100 }),
+    ).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    expect(prismaMock.notification.findMany).not.toHaveBeenCalled();
+  });
+
+  it('accepts the boundary values and passes a bounded take/skip', async () => {
+    await listNotifications(USER_ID, { page: 3, limit: MAX_NOTIFICATIONS_PAGE_SIZE });
+
+    expect(prismaMock.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ skip: 200, take: MAX_NOTIFICATIONS_PAGE_SIZE }),
+    );
+  });
+
+  it('accepts the minimum page and limit', async () => {
+    await listNotifications(USER_ID, { page: 1, limit: 1 });
+
+    expect(prismaMock.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ skip: 0, take: 1 }),
+    );
+  });
+});
+
 describe('markNotificationRead idempotent side effects (#121)', () => {
   it('does not invalidate unread cache when already read', async () => {
     const readAt = new Date('2026-01-01T00:00:00.000Z');
-    prismaMock.notification.findUnique.mockResolvedValue(
-      makeNotification({ id: 'n1', readAt }),
-    );
+    prismaMock.notification.findUnique.mockResolvedValue(makeNotification({ id: 'n1', readAt }));
 
     await markNotificationRead(USER_ID, 'n1');
 

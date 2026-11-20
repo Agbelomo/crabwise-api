@@ -9,6 +9,7 @@
 
 import type { Artwork } from '@prisma/client';
 
+import { AppError } from '@/middlewares';
 import { prisma } from '@/services';
 import { logger } from '@/utils/logger';
 
@@ -24,6 +25,35 @@ function debounceKey(userId: string, artworkId: string): string {
 
 function listKey(userId: string): string {
   return `recently-viewed:list:${userId}`;
+}
+
+/** Ids are opaque, but must never contain the key separator, whitespace or
+ * Redis glob characters, so one id can't address another user's keys (#128). */
+const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+export interface RecordViewOptions {
+  /**
+   * The authenticated caller. When supplied it must equal `userId`: a caller
+   * may only write their own history (#128).
+   */
+  readonly actorId?: string;
+}
+
+/**
+ * Ensures the history being written belongs to the caller and that both ids
+ * are safe to embed in Redis keys (#128). Throws `FORBIDDEN` on an ownership
+ * mismatch and `BAD_REQUEST` on a malformed id.
+ */
+function assertCanWriteHistory(userId: string, artworkId: string, actorId?: string): void {
+  if (typeof userId !== 'string' || !SAFE_ID_PATTERN.test(userId)) {
+    throw new AppError('BAD_REQUEST', 'Invalid user id');
+  }
+  if (typeof artworkId !== 'string' || !SAFE_ID_PATTERN.test(artworkId)) {
+    throw new AppError('BAD_REQUEST', 'Invalid artwork id');
+  }
+  if (actorId !== undefined && actorId !== userId) {
+    throw new AppError('FORBIDDEN', "Cannot record views in another user's history");
+  }
 }
 
 export interface ViewRecordingMetrics {
@@ -49,13 +79,18 @@ export interface RecordViewResult {
 
 /**
  * Records a view for "recently viewed" and trending, debounced to once per
- * user per artwork per hour. A no-op (never throws) when Redis isn't
- * configured.
+ * user per artwork per hour. A no-op when Redis isn't configured.
+ *
+ * Ownership is checked before anything is written (#128): when
+ * `options.actorId` is given it must match `userId`, otherwise `FORBIDDEN`
+ * is thrown and no Redis key is touched.
  */
 export async function recordArtworkView(
   userId: string,
   artworkId: string,
+  options: RecordViewOptions = {},
 ): Promise<RecordViewResult> {
+  assertCanWriteHistory(userId, artworkId, options.actorId);
   const redis = tryGetRedisClient();
   if (redis === undefined) {
     return { recorded: false };
@@ -127,9 +162,13 @@ export async function listRecentlyViewed(
  * are logged at debug level and counted in `getViewRecordingMetrics`, so a
  * Redis outage is visible without affecting response latency.
  */
-export async function recordArtworkViewSafely(userId: string, artworkId: string): Promise<void> {
+export async function recordArtworkViewSafely(
+  userId: string,
+  artworkId: string,
+  options: RecordViewOptions = {},
+): Promise<void> {
   try {
-    const { recorded } = await recordArtworkView(userId, artworkId);
+    const { recorded } = await recordArtworkView(userId, artworkId, options);
     if (recorded) {
       viewRecordingMetrics.recorded += 1;
     } else {
@@ -137,6 +176,11 @@ export async function recordArtworkViewSafely(userId: string, artworkId: string)
     }
   } catch (error) {
     viewRecordingMetrics.failed += 1;
+    if (error instanceof AppError && error.code === 'FORBIDDEN') {
+      // #128 — an attempted cross-user write is a bug or abuse, not noise.
+      logger.warn('rejected cross-user recently-viewed write', { userId, artworkId });
+      return;
+    }
     logger.debug('artwork view recording failed', {
       artworkId,
       message: error instanceof Error ? error.message : String(error),

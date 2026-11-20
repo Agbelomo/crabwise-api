@@ -61,6 +61,34 @@ export interface PaginatedNotifications {
 
 const UNREAD_COUNT_CACHE_TTL_SECONDS = 60;
 
+/** Largest page a caller may request (#122) — mirrors the HTTP schema cap. */
+export const MAX_NOTIFICATIONS_PAGE_SIZE = 100;
+
+/**
+ * Validates page/limit at the service boundary (#122) so non-HTTP callers
+ * (jobs, other services) can't request unbounded data: `take: NaN`/`Infinity`
+ * or a huge `limit` would otherwise disable or blow past the page cap, and a
+ * zero/negative/fractional page would yield a negative or invalid `skip`.
+ */
+function assertValidPagination(query: ListNotificationsQuery): void {
+  const { page, limit } = query;
+  if (!Number.isSafeInteger(page) || page < 1) {
+    throw new AppError('BAD_REQUEST', 'page must be a positive integer', {
+      details: { page },
+    });
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_NOTIFICATIONS_PAGE_SIZE) {
+    throw new AppError(
+      'BAD_REQUEST',
+      `limit must be an integer between 1 and ${MAX_NOTIFICATIONS_PAGE_SIZE}`,
+      { details: { limit } },
+    );
+  }
+  if (!Number.isSafeInteger((page - 1) * limit)) {
+    throw new AppError('BAD_REQUEST', 'page is out of range', { details: { page } });
+  }
+}
+
 function unreadCountKey(userId: string): string {
   return `notifications:unread:${userId}`;
 }
@@ -163,11 +191,16 @@ async function maybeEnqueueEmail(notification: Notification): Promise<void> {
 /**
  * Paginated, filterable list of a user's notifications (#842). `unreadOnly`
  * narrows to unread rows; the response always carries a fresh unread count.
+ *
+ * Invalid `page`/`limit` values are rejected with `BAD_REQUEST` before any
+ * query runs (#122), so a page is always bounded by
+ * `MAX_NOTIFICATIONS_PAGE_SIZE`.
  */
 export async function listNotifications(
   userId: string,
   query: ListNotificationsQuery,
 ): Promise<PaginatedNotifications> {
+  assertValidPagination(query);
   const where = {
     userId,
     ...(query.unreadOnly === true ? { readAt: null } : {}),
