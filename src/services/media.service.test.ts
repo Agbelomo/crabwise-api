@@ -40,6 +40,7 @@ vi.mock('./s3.service', () => ({
   objectExists: objectExistsMock,
   downloadObjectBuffer: s3DownloadMock,
   uploadObjectBuffer: s3UploadMock,
+  deleteObject: s3DeleteMock,
 }));
 vi.mock('sharp', () => ({
   default: vi.fn(() => ({
