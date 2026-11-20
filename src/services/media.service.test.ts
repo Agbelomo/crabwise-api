@@ -53,7 +53,7 @@ vi.mock('sharp', () => ({
   })),
 }));
 
-import { confirmMediaUpload } from './media.service';
+import { confirmMediaUpload, deleteMedia } from './media.service';
 import { processImage } from '../workers/media.worker';
 import type { Job } from 'bullmq';
 import type { ImageProcessingJobData } from '../queues/media.queue';
@@ -205,5 +205,42 @@ describe('media worker failure surfacing (#97)', () => {
 
     // Both variants created: thumbnail + webp.
     expect(prismaMock.media.create).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('deleteMedia ownership (#89)', () => {
+  beforeEach(() => {
+    s3DeleteMock.mockResolvedValue(undefined);
+    prismaMock.media.deleteMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('throws NOT_FOUND and deletes nothing when media is missing', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(null);
+
+    await expect(deleteMedia(USER_ID, MEDIA_ID)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(s3DeleteMock).not.toHaveBeenCalled();
+    expect(prismaMock.media.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('throws FORBIDDEN and never touches storage or DB for a non-owner', async () => {
+    await expect(deleteMedia('someone-else', MEDIA_ID)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    expect(s3DeleteMock).not.toHaveBeenCalled();
+    expect(prismaMock.media.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('deletes the object, its variants and DB rows for the owner', async () => {
+    prismaMock.media.findMany.mockResolvedValue([
+      makeMedia({ id: 'variant-1', key: 'images/user-1/file-thumb.webp', variantOfId: MEDIA_ID }),
+    ]);
+
+    await deleteMedia(USER_ID, MEDIA_ID);
+
+    expect(s3DeleteMock).toHaveBeenCalledWith('test-bucket', 'images/user-1/file.jpg');
+    expect(s3DeleteMock).toHaveBeenCalledWith('test-bucket', 'images/user-1/file-thumb.webp');
+    expect(prismaMock.media.deleteMany).toHaveBeenCalledTimes(1);
   });
 });
