@@ -61,6 +61,15 @@ export async function recordArtworkView(
     return { recorded: false };
   }
 
+  // #127 — always refresh position in the sorted set (idempotent member upsert).
+  // Re-viewing the same artwork moves it to the front without creating a duplicate
+  // entry; Redis ZADD updates the score for an existing member.
+  const key = listKey(userId);
+  await redis.zadd(key, Date.now(), artworkId);
+  await redis.zremrangebyrank(key, 0, -(MAX_RECENTLY_VIEWED + 1));
+
+  // Debounce only the trending side-effect so repeated views within the window
+  // do not inflate trending scores, while still allowing list position updates.
   const wasSet = await redis.set(
     debounceKey(userId, artworkId),
     '1',
@@ -72,9 +81,6 @@ export async function recordArtworkView(
     return { recorded: false };
   }
 
-  const key = listKey(userId);
-  await redis.zadd(key, Date.now(), artworkId);
-  await redis.zremrangebyrank(key, 0, -(MAX_RECENTLY_VIEWED + 1));
   await recordTrendingSignal(artworkId, 'view');
 
   return { recorded: true };

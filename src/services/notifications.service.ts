@@ -175,7 +175,9 @@ export async function listNotifications(
   const [items, total, unreadCount] = await Promise.all([
     prisma.notification.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      // #123 — deterministic tie-breaker so equal timestamps never reorder
+      // across pages (adjacent pages must not overlap).
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       skip: (query.page - 1) * query.limit,
       take: query.limit,
     }),
@@ -193,8 +195,9 @@ export async function listNotifications(
 }
 
 /**
- * Marks one notification as read (#842). Idempotent: an already-read
- * notification keeps its original `readAt` rather than being re-stamped.
+ * Marks one notification as read (#842 / #121).
+ * Idempotent: an already-read notification keeps its original `readAt` and
+ * does **not** re-invalidate the unread cache or perform another write.
  * Only the owner may mark their notification read.
  */
 export async function markNotificationRead(
@@ -205,14 +208,28 @@ export async function markNotificationRead(
   if (notification === null || notification.userId !== userId) {
     throw new AppError('NOT_FOUND', 'Notification not found');
   }
+  // #121 — already-read: no write, no cache invalidation side effects.
   if (notification.readAt !== null) {
     return toPublic(notification);
   }
-  const updated = await prisma.notification.update({
-    where: { id: notificationId },
+  // Conditional update: only rows still unread are stamped (race-safe).
+  const result = await prisma.notification.updateMany({
+    where: { id: notificationId, userId, readAt: null },
     data: { readAt: new Date() },
   });
+  if (result.count === 0) {
+    // Lost the race to another concurrent mark — re-read without side effects.
+    const current = await prisma.notification.findUnique({ where: { id: notificationId } });
+    if (current === null || current.userId !== userId) {
+      throw new AppError('NOT_FOUND', 'Notification not found');
+    }
+    return toPublic(current);
+  }
   await invalidateUnreadCount(userId);
+  const updated = await prisma.notification.findUnique({ where: { id: notificationId } });
+  if (updated === null) {
+    throw new AppError('NOT_FOUND', 'Notification not found');
+  }
   return toPublic(updated);
 }
 

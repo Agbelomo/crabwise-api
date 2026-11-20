@@ -148,7 +148,7 @@ describe('listNotifications (#842)', () => {
     expect(prismaMock.notification.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { userId: USER_ID },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
     );
   });
@@ -168,14 +168,20 @@ describe('listNotifications (#842)', () => {
 
 describe('markNotificationRead (#842)', () => {
   it('stamps readAt and invalidates the unread cache', async () => {
-    prismaMock.notification.findUnique.mockResolvedValue(makeNotification());
-    prismaMock.notification.update.mockResolvedValue(
-      makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
-    );
+    prismaMock.notification.findUnique
+      .mockResolvedValueOnce(makeNotification({ readAt: null }))
+      .mockResolvedValueOnce(
+        makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
+      );
+    prismaMock.notification.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await markNotificationRead(USER_ID, 'notif-1');
 
     expect(result.readAt).not.toBeNull();
+    expect(prismaMock.notification.updateMany).toHaveBeenCalledWith({
+      where: { id: 'notif-1', userId: USER_ID, readAt: null },
+      data: { readAt: expect.any(Date) },
+    });
     expect(redisMock.del).toHaveBeenCalledWith(`notifications:unread:${USER_ID}`);
   });
 
@@ -187,6 +193,8 @@ describe('markNotificationRead (#842)', () => {
 
     expect(result.readAt).toEqual(readAt);
     expect(prismaMock.notification.update).not.toHaveBeenCalled();
+    expect(prismaMock.notification.updateMany).not.toHaveBeenCalled();
+    expect(redisMock.del).not.toHaveBeenCalled();
   });
 
   it("rejects another user's notification with NOT_FOUND", async () => {
@@ -215,9 +223,19 @@ describe('markAllNotificationsRead (#842)', () => {
 
 describe('getUnreadCount (#842)', () => {
   it('serves the count from cache when present', async () => {
+    // Legacy bare number still honored; envelope form preferred by writer.
     redisMock.get.mockResolvedValue('5');
 
     await expect(getUnreadCount(USER_ID)).resolves.toBe(5);
+    expect(prismaMock.notification.count).not.toHaveBeenCalled();
+  });
+
+  it('serves envelope-cached unread counts', async () => {
+    redisMock.get.mockResolvedValue(
+      JSON.stringify({ v: 7, exp: Date.now() + 60_000 }),
+    );
+
+    await expect(getUnreadCount(USER_ID)).resolves.toBe(7);
     expect(prismaMock.notification.count).not.toHaveBeenCalled();
   });
 
@@ -227,7 +245,12 @@ describe('getUnreadCount (#842)', () => {
     prismaMock.notification.count.mockResolvedValue(9);
 
     await expect(getUnreadCount(USER_ID)).resolves.toBe(9);
-    expect(redisMock.set).toHaveBeenCalledWith(`notifications:unread:${USER_ID}`, '9', 'EX', 60);
+    expect(redisMock.set).toHaveBeenCalledWith(
+      `notifications:unread:${USER_ID}`,
+      expect.stringContaining('"v":9'),
+      'EX',
+      60,
+    );
   });
 });
 
@@ -283,14 +306,47 @@ describe('markNotificationRead recipient ownership (#120)', () => {
   });
 
   it('allows the owner to mark their own notification read', async () => {
-    prismaMock.notification.findUnique.mockResolvedValue(makeNotification());
-    prismaMock.notification.update.mockResolvedValue(
-      makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
-    );
+    prismaMock.notification.findUnique
+      .mockResolvedValueOnce(makeNotification({ readAt: null }))
+      .mockResolvedValueOnce(
+        makeNotification({ readAt: new Date('2026-10-02T00:00:00.000Z') }),
+      );
+    prismaMock.notification.updateMany.mockResolvedValue({ count: 1 });
 
     const result = await markNotificationRead(USER_ID, 'notif-1');
 
     expect(result.readAt).not.toBeNull();
-    expect(prismaMock.notification.update).toHaveBeenCalled();
+    expect(prismaMock.notification.updateMany).toHaveBeenCalled();
+  });
+});
+
+
+describe('listNotifications ordering (#123)', () => {
+  it('orders by createdAt desc then id desc for stable pagination', async () => {
+    prismaMock.notification.findMany.mockResolvedValue([]);
+    prismaMock.notification.count.mockResolvedValue(0);
+    redisMock.get.mockResolvedValue('0');
+
+    await listNotifications(USER_ID, { page: 1, limit: 20 });
+
+    expect(prismaMock.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      }),
+    );
+  });
+});
+
+describe('markNotificationRead idempotent side effects (#121)', () => {
+  it('does not invalidate unread cache when already read', async () => {
+    const readAt = new Date('2026-01-01T00:00:00.000Z');
+    prismaMock.notification.findUnique.mockResolvedValue(
+      makeNotification({ id: 'n1', readAt }),
+    );
+
+    await markNotificationRead(USER_ID, 'n1');
+
+    expect(prismaMock.notification.updateMany).not.toHaveBeenCalled();
+    expect(redisMock.del).not.toHaveBeenCalled();
   });
 });

@@ -51,6 +51,31 @@ function namespaceOf(key: string): string {
  * Cache-aside read: serve `key` from Redis if present, otherwise call
  * `fetcher`, cache its result for `ttlSeconds`, and return it.
  */
+/** On-disk cache envelope so TTL can be enforced even when Redis is mocked
+ * or a key somehow outlives its EX (#124). */
+interface CacheEnvelope<T> {
+  readonly v: T;
+  /** Absolute expiry time in epoch milliseconds. */
+  readonly exp: number;
+}
+
+function isEnvelope(value: unknown): value is CacheEnvelope<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'v' in value &&
+    'exp' in value &&
+    typeof (value as CacheEnvelope<unknown>).exp === 'number'
+  );
+}
+
+/**
+ * Cache-aside read: serve `key` from Redis if present **and not expired**,
+ * otherwise call `fetcher`, cache its result for `ttlSeconds`, and return it.
+ *
+ * Expired entries (past `exp`) are treated as misses, deleted, and refreshed
+ * (#124), independent of Redis key eviction.
+ */
 export async function cached<T>(
   key: string,
   ttlSeconds: number,
@@ -64,13 +89,32 @@ export async function cached<T>(
   const namespace = namespaceOf(key);
   const hit = await redis.get(key);
   if (hit !== null) {
-    metricsFor(namespace).hits += 1;
-    return JSON.parse(hit) as T;
+    try {
+      const parsed: unknown = JSON.parse(hit);
+      if (isEnvelope(parsed)) {
+        if (Date.now() < parsed.exp) {
+          metricsFor(namespace).hits += 1;
+          return parsed.v as T;
+        }
+        // Expired — treat as miss and drop the stale key (#124).
+        await redis.del(key);
+      } else {
+        // Legacy bare value (pre-envelope): honor Redis presence only.
+        metricsFor(namespace).hits += 1;
+        return parsed as T;
+      }
+    } catch {
+      await redis.del(key);
+    }
   }
 
   metricsFor(namespace).misses += 1;
   const value = await fetcher();
-  await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds);
+  const envelope: CacheEnvelope<T> = {
+    v: value,
+    exp: Date.now() + ttlSeconds * 1000,
+  };
+  await redis.set(key, JSON.stringify(envelope), 'EX', ttlSeconds);
   return value;
 }
 
