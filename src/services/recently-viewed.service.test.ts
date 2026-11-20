@@ -12,7 +12,11 @@ vi.mock('@/utils/logger', () => ({ logger: loggerMock }));
 vi.mock('./redis.service', () => ({ tryGetRedisClient: tryGetRedisClientMock }));
 vi.mock('./trending.service', () => ({ recordTrendingSignal: recordTrendingSignalMock }));
 
-import { getViewRecordingMetrics, recordArtworkViewSafely } from './recently-viewed.service';
+import {
+  getViewRecordingMetrics,
+  recordArtworkView,
+  recordArtworkViewSafely,
+} from './recently-viewed.service';
 
 const metrics = () => ({ ...getViewRecordingMetrics() });
 
@@ -25,6 +29,8 @@ describe('recordArtworkViewSafely', () => {
   it('counts a recorded view', async () => {
     tryGetRedisClientMock.mockReturnValue(redisMock);
     redisMock.set.mockResolvedValue('OK');
+    redisMock.zadd.mockResolvedValue(1);
+    redisMock.zremrangebyrank.mockResolvedValue(0);
     const before = metrics();
 
     await recordArtworkViewSafely('user-1', 'art-1');
@@ -44,7 +50,7 @@ describe('recordArtworkViewSafely', () => {
 
   it('logs and counts a Redis failure without rejecting', async () => {
     tryGetRedisClientMock.mockReturnValue(redisMock);
-    redisMock.set.mockRejectedValue(new Error('redis down'));
+    redisMock.zadd.mockRejectedValue(new Error('redis down'));
     const before = metrics();
 
     await expect(recordArtworkViewSafely('user-1', 'art-1')).resolves.toBeUndefined();
@@ -54,5 +60,36 @@ describe('recordArtworkViewSafely', () => {
       'artwork view recording failed',
       expect.objectContaining({ artworkId: 'art-1', message: 'redis down' }),
     );
+  });
+});
+
+describe('recordArtworkView idempotent position (#127)', () => {
+  it('updates ZSET position on every view without relying on debounce', async () => {
+    tryGetRedisClientMock.mockReturnValue(redisMock);
+    redisMock.zadd.mockResolvedValue(1);
+    redisMock.zremrangebyrank.mockResolvedValue(0);
+    redisMock.set.mockResolvedValue('OK');
+
+    await recordArtworkView('user-1', 'art-1');
+    expect(redisMock.zadd).toHaveBeenCalledWith(
+      'recently-viewed:list:user-1',
+      expect.any(Number),
+      'art-1',
+    );
+
+    // Debounced second view: still refreshes position, skips trending.
+    redisMock.set.mockResolvedValue(null);
+    redisMock.zadd.mockClear();
+    recordTrendingSignalMock.mockClear();
+
+    const result = await recordArtworkView('user-1', 'art-1');
+    expect(result.recorded).toBe(false);
+    expect(redisMock.zadd).toHaveBeenCalledTimes(1);
+    expect(redisMock.zadd).toHaveBeenCalledWith(
+      'recently-viewed:list:user-1',
+      expect.any(Number),
+      'art-1',
+    );
+    expect(recordTrendingSignalMock).not.toHaveBeenCalled();
   });
 });
