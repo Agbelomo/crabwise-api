@@ -11,6 +11,7 @@ const { prismaMock, txMock } = vi.hoisted(() => {
     commission: { findUnique: vi.fn(), update: vi.fn() },
     deliverable: {
       create: vi.fn(),
+      findFirst: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
       count: vi.fn(),
@@ -84,6 +85,7 @@ beforeEach(() => {
   txMock.commissionEvent.create.mockResolvedValue({ id: 'event-1' });
   txMock.notification.create.mockResolvedValue({ id: 'notification-1' });
   txMock.media.findMany.mockResolvedValue([{ id: 'media-1' }]);
+  txMock.deliverable.findFirst.mockResolvedValue(null);
   txMock.deliverable.findUnique.mockResolvedValue(makeDeliverable());
   txMock.deliverable.update.mockImplementation(async ({ data }: { data: { status: string } }) =>
     makeDeliverable(data.status),
@@ -125,6 +127,190 @@ describe('verifyDeliverableAccess (#99)', () => {
 });
 
 describe('submitDeliverable (#784)', () => {
+  it('reuses a WIP with an equivalent note and the same ordered attachments', async () => {
+    const media = [
+      { deliverableId: DELIVERABLE_ID, mediaId: 'media-1', sort: 0 },
+      { deliverableId: DELIVERABLE_ID, mediaId: 'media-2', sort: 1 },
+    ];
+    txMock.media.findMany.mockResolvedValue([{ id: 'media-1' }, { id: 'media-2' }]);
+    txMock.deliverable.create.mockResolvedValueOnce({
+      ...makeDeliverable('SUBMITTED', 'WIP'),
+      note: 'Sketch',
+      media,
+    });
+    const first = await submitDeliverable(COMMISSION_ID, ARTIST_ID, {
+      type: 'WIP',
+      note: '  Sketch  ',
+      mediaIds: ['media-1', 'media-2', 'media-1'],
+    });
+    txMock.deliverable.findFirst.mockResolvedValueOnce(first.deliverable);
+
+    await expect(
+      submitDeliverable(COMMISSION_ID, ARTIST_ID, {
+        type: 'WIP',
+        note: 'Sketch',
+        mediaIds: ['media-1', 'media-2'],
+      }),
+    ).resolves.toEqual(first);
+    expect(txMock.deliverable.findFirst).toHaveBeenNthCalledWith(2, {
+      where: { commissionId: COMMISSION_ID, status: { not: 'UPLOADED' } },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      include: { media: { orderBy: { sort: 'asc' } } },
+    });
+    expect(txMock.deliverable.create).toHaveBeenCalledTimes(1);
+    expect(txMock.deliverable.create.mock.calls[0]?.[0].data.media.create).toEqual(
+      media.map(({ mediaId, sort }) => ({ mediaId, sort })),
+    );
+    expect(txMock.notification.create).toHaveBeenCalledTimes(1);
+    expect(txMock.commission.update).not.toHaveBeenCalled();
+    expect(txMock.commissionEvent.create).not.toHaveBeenCalled();
+  });
+
+  it('reuses the final submission after delivery and rejects different content', async () => {
+    const first = await submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL' });
+    txMock.commission.findUnique.mockResolvedValue(makeCommission('DELIVERED'));
+    txMock.deliverable.findFirst
+      .mockResolvedValueOnce(first.deliverable)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(first.deliverable);
+
+    await expect(
+      submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL', note: '  ' }),
+    ).resolves.toEqual(first);
+    await expect(
+      submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL', note: 'Replacement' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(txMock.deliverable.create).toHaveBeenCalledTimes(1);
+    expect(txMock.commission.update).toHaveBeenCalledTimes(1);
+    expect(txMock.commissionEvent.create).toHaveBeenCalledTimes(1);
+    expect(txMock.notification.create).toHaveBeenCalledTimes(1);
+    expect(first.commissionStatus).toBe('DELIVERED');
+  });
+
+  it('treats reordered media as a new WIP version', async () => {
+    txMock.deliverable.findFirst.mockResolvedValueOnce({
+      ...makeDeliverable('SUBMITTED', 'WIP'),
+      media: [
+        { mediaId: 'media-1', sort: 0 },
+        { mediaId: 'media-2', sort: 1 },
+      ],
+    });
+    txMock.media.findMany.mockResolvedValue([{ id: 'media-1' }, { id: 'media-2' }]);
+    txMock.deliverable.create.mockResolvedValueOnce({
+      ...makeDeliverable('SUBMITTED', 'WIP'),
+      id: 'new-version',
+      media: [],
+    });
+
+    const result = await submitDeliverable(COMMISSION_ID, ARTIST_ID, {
+      type: 'WIP',
+      mediaIds: ['media-2', 'media-1'],
+    });
+
+    expect(result.deliverable.id).toBe('new-version');
+    expect(txMock.deliverable.create.mock.calls[0]?.[0].data.media.create).toEqual([
+      { mediaId: 'media-2', sort: 0 },
+      { mediaId: 'media-1', sort: 1 },
+    ]);
+  });
+
+  it('creates a new version with the same content after a revision request', async () => {
+    const input = { type: 'FINAL' } as const;
+    const first = await submitDeliverable(COMMISSION_ID, ARTIST_ID, input);
+    txMock.commission.findUnique.mockResolvedValue(makeCommission('DELIVERED'));
+    txMock.deliverable.findUnique.mockResolvedValueOnce(first.deliverable);
+
+    const review = await reviewDeliverable(COMMISSION_ID, first.deliverable.id, CLIENT_ID, {
+      decision: 'REQUEST_CHANGES',
+      note: 'Please revise',
+    });
+    expect(review.revisionCount).toBe(1);
+    expect(review.commissionStatus).toBe('IN_PROGRESS');
+
+    txMock.commission.findUnique.mockResolvedValue(makeCommission(review.commissionStatus));
+    txMock.deliverable.findFirst.mockResolvedValueOnce(review.deliverable);
+    txMock.deliverable.create.mockResolvedValueOnce({ ...first.deliverable, id: 'revised' });
+
+    const second = await submitDeliverable(COMMISSION_ID, ARTIST_ID, input);
+    expect(second.deliverable.id).toBe('revised');
+    expect(second.commissionStatus).toBe('DELIVERED');
+    expect(txMock.deliverable.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows a fresh WIP when an older version was rejected after the latest submission', async () => {
+    const latest = { ...makeDeliverable('SUBMITTED', 'WIP'), media: [] };
+    txMock.deliverable.findFirst
+      .mockResolvedValueOnce(latest)
+      .mockResolvedValueOnce({ id: 'rejected-older-version' });
+    txMock.deliverable.create.mockResolvedValueOnce({ ...latest, id: 'fresh-wip' });
+
+    const result = await submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'WIP' });
+
+    expect(result.deliverable.id).toBe('fresh-wip');
+    expect(txMock.deliverable.findFirst).toHaveBeenLastCalledWith({
+      where: {
+        commissionId: COMMISSION_ID,
+        status: 'REJECTED',
+        updatedAt: { gt: latest.createdAt },
+      },
+      select: { id: true },
+    });
+  });
+
+  it('checks authorization before looking up a matching final submission', async () => {
+    txMock.commission.findUnique.mockResolvedValue(makeCommission('DELIVERED'));
+    txMock.deliverable.findFirst.mockResolvedValue({ ...makeDeliverable(), media: [] });
+
+    await expect(
+      submitDeliverable(COMMISSION_ID, UNRELATED_USER_ID, { type: 'FINAL' }),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(txMock.deliverable.findFirst).not.toHaveBeenCalled();
+    expect(txMock.notification.create).not.toHaveBeenCalled();
+  });
+
+  it('retries a serialization conflict and reuses the committed winner', async () => {
+    const conflict = new Prisma.PrismaClientKnownRequestError('Serialization conflict', {
+      code: 'P2034',
+      clientVersion: Prisma.prismaVersion.client,
+    });
+    const winner = { ...makeDeliverable(), media: [] };
+    prismaMock.$transaction.mockImplementationOnce(async (callback) => {
+      await callback(txMock);
+      // The first transaction is rolled back by PostgreSQL at commit time.
+      txMock.commission.findUnique.mockResolvedValue(makeCommission('DELIVERED'));
+      txMock.deliverable.findFirst.mockResolvedValueOnce(winner);
+      throw conflict;
+    });
+
+    await expect(submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'FINAL' })).resolves.toEqual({
+      deliverable: winner,
+      commissionStatus: 'DELIVERED',
+    });
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(2);
+    expect(prismaMock.$transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+      isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+    });
+    expect(txMock.deliverable.create).toHaveBeenCalledTimes(1);
+    expect(txMock.commissionEvent.create).toHaveBeenCalledTimes(1);
+    expect(txMock.notification.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates a serialization conflict after three attempts', async () => {
+    const conflict = new Prisma.PrismaClientKnownRequestError('Serialization conflict', {
+      code: 'P2034',
+      clientVersion: Prisma.prismaVersion.client,
+    });
+    prismaMock.$transaction
+      .mockRejectedValueOnce(conflict)
+      .mockRejectedValueOnce(conflict)
+      .mockRejectedValueOnce(conflict);
+
+    await expect(submitDeliverable(COMMISSION_ID, ARTIST_ID, { type: 'WIP' })).rejects.toBe(
+      conflict,
+    );
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(3);
+  });
+
   it('records a FINAL submission, moves the commission to DELIVERED and notifies the client', async () => {
     const result = await submitDeliverable(COMMISSION_ID, ARTIST_ID, {
       type: 'FINAL',
@@ -207,7 +393,7 @@ describe('submitDeliverable (#784)', () => {
               { mediaId: 'media-2', sort: 1 },
             ],
           },
-        },
+        }),
       }),
     );
   });
@@ -238,7 +424,9 @@ describe('submitDeliverable (#784)', () => {
         }),
       ).rejects.toBe(failure);
 
-      expect(prismaMock.$transaction).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+      expect(prismaMock.$transaction).toHaveBeenCalledExactlyOnceWith(expect.any(Function), {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      });
       // Rejecting the callback is what tells Prisma to roll back. Merely
       // rejecting outside it (after committing partial writes) is too late.
       await expect(prismaMock.$transaction.mock.results[0]!.value).rejects.toBe(failure);
@@ -255,7 +443,7 @@ describe('submitDeliverable (#784)', () => {
             ],
           },
         },
-        include: { media: true },
+        include: { media: { orderBy: { sort: 'asc' } } },
       });
       for (const write of writes.slice(0, writes.indexOf(failingWrite) + 1)) {
         expect(write).toHaveBeenCalledTimes(1);
@@ -368,7 +556,7 @@ describe('submitDeliverable (#784)', () => {
     ).rejects.toBe(error);
   });
 
-  it.each(['PENDING', 'DELIVERED', 'COMPLETED', 'CANCELLED'](
+  it.each(['PENDING', 'DELIVERED', 'COMPLETED', 'CANCELLED'])(
     'rejects a submission while the commission is %s',
     async (status) => {
       txMock.commission.findUnique.mockResolvedValue(makeCommission(status));
