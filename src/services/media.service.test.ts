@@ -50,7 +50,7 @@ vi.mock('sharp', () => ({
   })),
 }));
 
-import { confirmMediaUpload } from './media.service';
+import { confirmMediaUpload, getMediaRecord } from './media.service';
 import { processImage } from '../workers/media.worker';
 import type { Job } from 'bullmq';
 import type { ImageProcessingJobData } from '../queues/media.queue';
@@ -92,6 +92,35 @@ beforeEach(() => {
   objectExistsMock.mockResolvedValue(true);
   s3DownloadMock.mockResolvedValue(Buffer.from('original-image'));
   s3UploadMock.mockResolvedValue(undefined);
+});
+
+describe('absent media records', () => {
+  it('returns a stable NOT_FOUND result when confirming missing media', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(null);
+
+    await expect(confirmMediaUpload(USER_ID, 'missing-media')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'Media not found',
+    });
+  });
+
+  it('returns the same stable NOT_FOUND result when fetching missing media', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(null);
+
+    await expect(getMediaRecord('missing-media')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'Media not found',
+    });
+  });
+
+  it('does not enqueue processing for an absent media record', async () => {
+    prismaMock.media.findUnique.mockResolvedValue(null);
+
+    await expect(confirmMediaUpload(USER_ID, 'missing-media')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(enqueueMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('confirmMediaUpload S3 verification (#873)', () => {

@@ -36,6 +36,10 @@ export interface PresignUploadResult {
 
 const PRESIGNED_UPLOAD_TTL_SECONDS = 300;
 
+function throwMediaNotFound(): never {
+  throw new AppError('NOT_FOUND', 'Media not found');
+}
+
 async function assertParentOwnership(
   userId: string,
   parentType: 'ARTWORK' | 'PORTFOLIO',
@@ -178,7 +182,7 @@ function shouldVerifyUploadExists(): boolean {
 export async function confirmMediaUpload(userId: string, mediaId: string): Promise<MediaRecord> {
   const media = await prisma.media.findUnique({ where: { id: mediaId } });
   if (media === null) {
-    throw new AppError('NOT_FOUND', 'Media not found');
+    throwMediaNotFound();
   }
   if (media.userId !== userId) {
     throw new AppError('FORBIDDEN', 'You do not own this media');
@@ -210,7 +214,7 @@ export async function confirmMediaUpload(userId: string, mediaId: string): Promi
 export async function getMediaRecord(mediaId: string): Promise<MediaRecord> {
   const media = await prisma.media.findUnique({ where: { id: mediaId } });
   if (media === null) {
-    throw new AppError('NOT_FOUND', 'Media not found');
+    throwMediaNotFound();
   }
   return toMediaRecord(media);
 }
