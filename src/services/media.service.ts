@@ -128,6 +128,8 @@ export interface MediaRecord {
   readonly createdAt: Date;
 }
 
+const GENERATED_IMAGE_VARIANT_LABELS = ['thumbnail', 'webp'] as const;
+
 async function toMediaRecord(media: {
   id: string;
   type: 'IMAGE' | 'DIGITAL_FILE';
@@ -139,6 +141,18 @@ async function toMediaRecord(media: {
   createdAt: Date;
 }): Promise<MediaRecord> {
   const variants = await prisma.media.findMany({ where: { variantOfId: media.id } });
+  const variantsByLabel = new Map(
+    variants
+      .filter((v) => v.variantLabel !== null)
+      .map((v) => [v.variantLabel as string, v]),
+  );
+  const completeVariants = GENERATED_IMAGE_VARIANT_LABELS.every((label) =>
+    variantsByLabel.has(label),
+  );
+  const persistedVariants = completeVariants
+    ? GENERATED_IMAGE_VARIANT_LABELS.map((label) => variantsByLabel.get(label)!)
+    : [];
+
   return {
     id: media.id,
     type: media.type,
@@ -148,7 +162,7 @@ async function toMediaRecord(media: {
     width: media.width,
     height: media.height,
     createdAt: media.createdAt,
-    variants: variants.map((v) => ({
+    variants: persistedVariants.map((v) => ({
       label: v.variantLabel ?? 'variant',
       url: buildPublicUrl(v.key),
       width: v.width,

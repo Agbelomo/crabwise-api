@@ -50,7 +50,7 @@ vi.mock('sharp', () => ({
   })),
 }));
 
-import { confirmMediaUpload } from './media.service';
+import { confirmMediaUpload, getMediaRecord } from './media.service';
 import { processImage } from '../workers/media.worker';
 import type { Job } from 'bullmq';
 import type { ImageProcessingJobData } from '../queues/media.queue';
@@ -157,6 +157,52 @@ describe('confirmMediaUpload S3 verification (#873)', () => {
   });
 });
 
+describe('complete media variant persistence', () => {
+  it('does not expose a partial variant set as complete', async () => {
+    prismaMock.media.findMany.mockResolvedValue([
+      {
+        id: 'thumbnail-1',
+        key: 'images/variants/thumbnail/media-1.jpg',
+        variantLabel: 'thumbnail',
+        width: 300,
+        height: 200,
+      },
+    ]);
+
+    await expect(getMediaRecord(MEDIA_ID)).resolves.toMatchObject({ variants: [] });
+  });
+
+  it('exposes both variants only after both metadata rows exist', async () => {
+    prismaMock.media.findMany.mockResolvedValue([
+      {
+        id: 'thumbnail-1',
+        key: 'images/variants/thumbnail/media-1.jpg',
+        variantLabel: 'thumbnail',
+        width: 300,
+        height: 200,
+      },
+      {
+        id: 'webp-1',
+        key: 'images/variants/webp/media-1.webp',
+        variantLabel: 'webp',
+        width: 1200,
+        height: 800,
+      },
+    ]);
+
+    const media = await getMediaRecord(MEDIA_ID);
+
+    expect(media.variants).toHaveLength(2);
+    expect(media.variants.map((variant) => variant.label)).toEqual(['thumbnail', 'webp']);
+  });
+
+  it('surfaces metadata lookup failures instead of returning an incomplete record', async () => {
+    prismaMock.media.findMany.mockRejectedValue(new Error('variant metadata unavailable'));
+
+    await expect(getMediaRecord(MEDIA_ID)).rejects.toThrow('variant metadata unavailable');
+  });
+});
+
 describe('media worker failure surfacing (#97)', () => {
   it('re-throws so BullMQ marks the job failed when the original download fails', async () => {
     s3DownloadMock.mockRejectedValue(new Error('S3 download failed'));
@@ -177,6 +223,15 @@ describe('media worker failure surfacing (#97)', () => {
     prismaMock.media.create.mockRejectedValue(new Error('prisma write failed'));
 
     await expect(processImage(makeJob())).rejects.toThrow('prisma write failed');
+  });
+
+  it('re-throws when the second variant metadata write fails after the first variant persists', async () => {
+    prismaMock.media.create
+      .mockResolvedValueOnce({ id: 'thumbnail-1' })
+      .mockRejectedValueOnce(new Error('webp metadata write failed'));
+
+    await expect(processImage(makeJob())).rejects.toThrow('webp metadata write failed');
+    expect(prismaMock.media.create).toHaveBeenCalledTimes(2);
   });
 
   it('re-throws when the S3 variant upload fails', async () => {
