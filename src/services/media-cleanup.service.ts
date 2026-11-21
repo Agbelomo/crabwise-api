@@ -36,6 +36,7 @@ export async function cleanupOrphanedMedia(): Promise<MediaCleanupStats> {
 
   let deleted = 0;
   let failed = 0;
+  const errors: unknown[] = [];
 
   for (const media of orphaned) {
     try {
@@ -44,6 +45,7 @@ export async function cleanupOrphanedMedia(): Promise<MediaCleanupStats> {
       deleted += 1;
     } catch (error) {
       failed += 1;
+      errors.push(error);
       logger.error('media-cleanup: failed to delete orphaned media', {
         mediaId: media.id,
         message: error instanceof Error ? error.message : String(error),
@@ -53,5 +55,12 @@ export async function cleanupOrphanedMedia(): Promise<MediaCleanupStats> {
 
   const stats: MediaCleanupStats = { scanned: orphaned.length, deleted, failed };
   logger.info('media-cleanup: run complete', { ...stats });
+  // Finish the batch, then reject so the queue worker marks the job as failed.
+  if (failed > 0) {
+    throw new AggregateError(
+      errors,
+      `media-cleanup: failed to delete ${failed} of ${orphaned.length} orphaned media`,
+    );
+  }
   return stats;
 }
