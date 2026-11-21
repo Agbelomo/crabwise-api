@@ -47,6 +47,7 @@ export const DELIVERABLE_NOTE_MAX_LENGTH = 2000;
  * allowed — so a version can never be replaced out from under a review.
  */
 const SUBMITTABLE_STATUSES: readonly CommissionStatus[] = ['ACCEPTED', 'IN_PROGRESS'];
+const SUBMISSION_ATTEMPTS = 3;
 
 export interface SubmitDeliverableInput {
   readonly type: DeliverableType;
@@ -122,8 +123,8 @@ export async function verifyDeliverableAccess(commissionId: string, userId: stri
 /**
  * The artist on a commission submits a WIP draft or the final artefact.
  *
- * Only the assigned artist may submit (#784), only while the commission is
- * `ACCEPTED`/`IN_PROGRESS`, and every attached media row must belong to that
+ * Only the assigned artist may submit (#784). New versions require an
+ * `ACCEPTED`/`IN_PROGRESS` commission, and attached media must belong to that
  * artist — otherwise an artist could reference (and effectively publish)
  * someone else's upload. The client is notified with the submission details,
  * and a `FINAL` submission moves the commission to `DELIVERED` and appends
@@ -134,8 +135,9 @@ export async function submitDeliverable(
   artistId: string,
   input: SubmitDeliverableInput,
 ): Promise<SubmitDeliverableResult> {
-  const note = input.note?.trim() ?? '';
-  assertNoteLength(note);
+  const trimmedNote = input.note?.trim() ?? '';
+  assertNoteLength(trimmedNote);
+  const note = trimmedNote || null;
 
   const mediaIds = [...new Set(input.mediaIds ?? [])];
   if (mediaIds.length > DELIVERABLE_MAX_MEDIA) {
@@ -148,7 +150,7 @@ export async function submitDeliverable(
   // Keep the deliverable, nested media links and submission side effects in
   // one transaction. Let failures escape the callback so Prisma rolls back
   // every write, including links created before a later attachment fails.
-  return prisma.$transaction(async (tx) => {
+  const submit = async (tx: Prisma.TransactionClient): Promise<SubmitDeliverableResult> => {
     const commission = await tx.commission.findUnique({ where: { id: commissionId } });
     if (commission === null) {
       throw new AppError('NOT_FOUND', 'Commission not found');
@@ -156,7 +158,39 @@ export async function submitDeliverable(
     if (commission.artistId !== artistId) {
       throw new AppError('FORBIDDEN', 'Only the artist on this commission can submit deliverables');
     }
-    if (!SUBMITTABLE_STATUSES.includes(commission.status)) {
+    // A retry can reuse only the latest submitted version in the current
+    // attempt. A newer version or a rejection starts a fresh attempt, even
+    // when the artist resubmits older content. Attachment order is significant.
+    const canSubmit = SUBMITTABLE_STATUSES.includes(commission.status);
+    if (canSubmit || (commission.status === 'DELIVERED' && input.type === 'FINAL')) {
+      const latest = await tx.deliverable.findFirst({
+        where: { commissionId, status: { not: 'UPLOADED' } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        include: { media: { orderBy: { sort: 'asc' } } },
+      });
+      if (
+        latest?.status === 'SUBMITTED' &&
+        latest.type === input.type &&
+        (latest.note?.trim() || null) === note &&
+        latest.media.length === mediaIds.length &&
+        latest.media.every(({ mediaId }, index) => mediaId === mediaIds[index])
+      ) {
+        // The client may request changes on an older version too.
+        const laterRejection = await tx.deliverable.findFirst({
+          where: {
+            commissionId,
+            status: REVISION_STATUS,
+            updatedAt: { gt: latest.createdAt },
+          },
+          select: { id: true },
+        });
+        if (laterRejection === null) {
+          return { deliverable: latest, commissionStatus: commission.status };
+        }
+      }
+    }
+
+    if (!canSubmit) {
       throw new AppError(
         'CONFLICT',
         `Deliverables can only be submitted while a commission is ${SUBMITTABLE_STATUSES.join(' or ')} (this one is ${commission.status})`,
@@ -178,14 +212,14 @@ export async function submitDeliverable(
         data: {
           commissionId,
           type: input.type,
-          note: note === '' ? null : note,
+          note,
           // The artist is submitting this version, not merely uploading it.
           status: 'SUBMITTED',
           ...(mediaIds.length > 0
             ? { media: { create: mediaIds.map((mediaId, sort) => ({ mediaId, sort })) } }
             : {}),
         },
-        include: { media: true },
+        include: { media: { orderBy: { sort: 'asc' } } },
       })
       .catch((error: unknown) => {
         // The commission can be deleted between the lookup and the insert.
@@ -227,7 +261,7 @@ export async function submitDeliverable(
           commissionId,
           deliverableId: deliverable.id,
           type: input.type,
-          note: note === '' ? null : note,
+          note,
           mediaCount: mediaIds.length,
           commissionStatus,
         },
@@ -235,7 +269,25 @@ export async function submitDeliverable(
     });
 
     return { deliverable, commissionStatus };
-  });
+  };
+
+  // PostgreSQL can abort one of two overlapping read-before-insert
+  // transactions. Retry the entire transaction so it sees the winning row.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await prisma.$transaction(submit, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      });
+    } catch (error) {
+      if (
+        attempt === SUBMISSION_ATTEMPTS ||
+        !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+        error.code !== 'P2034'
+      ) {
+        throw error;
+      }
+    }
+  }
 }
 
 /**
