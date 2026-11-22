@@ -11,6 +11,12 @@
  * logged with context, and re-thrown so BullMQ marks the job as failed and
  * the queue receives the failure (retry/backoff and dead-letter handling
  * then apply instead of the job silently vanishing).
+ *
+ * Retries are safe (#96). Variant object keys are deterministic (derived from
+ * the original id and variant label) and `Media.key` is unique, so a retried
+ * job overwrites the same S3 objects and upserts the same rows instead of
+ * accumulating duplicate variants. This also lets a retry converge after a
+ * partial failure (thumbnail persisted, WebP write failed).
  */
 
 import { Worker, type Job } from 'bullmq';
@@ -26,7 +32,7 @@ import { IMAGE_PROCESSING_QUEUE_NAME, type ImageProcessingJobData } from '../que
 const THUMBNAIL_WIDTH_PX = 300;
 const WEBP_QUALITY = 80;
 
-async function createVariant(
+async function upsertVariant(
   original: { id: string; userId: string; key: string },
   label: 'thumbnail' | 'webp',
   buffer: Buffer,
@@ -41,16 +47,34 @@ async function createVariant(
     `${original.id}.${extension}`,
   );
   await uploadObjectBuffer(key, buffer, mimeType);
-  await prisma.media.create({
-    data: {
+
+  // The key is deterministic per (original, label) and unique in `Media`, so
+  // a repeated job must update the existing variant row rather than insert a
+  // second one. Using `create` here would hit the unique constraint on retry
+  // — leaving a half-persisted variant set and failing every subsequent
+  // attempt forever.
+  await prisma.media.upsert({
+    where: { key },
+    create: {
       userId: original.userId,
       type: 'IMAGE',
       bucket: env.s3Bucket ?? '',
       key,
       mimeType,
       size: BigInt(buffer.byteLength),
-      width: width ?? undefined,
-      height: height ?? undefined,
+      width: width ?? null,
+      height: height ?? null,
+      variantOfId: original.id,
+      variantLabel: label,
+    },
+    update: {
+      userId: original.userId,
+      type: 'IMAGE',
+      bucket: env.s3Bucket ?? '',
+      mimeType,
+      size: BigInt(buffer.byteLength),
+      width: width ?? null,
+      height: height ?? null,
       variantOfId: original.id,
       variantLabel: label,
     },
@@ -72,7 +96,7 @@ export async function processImage(job: Job<ImageProcessingJobData>): Promise<vo
     const thumbnail = await sharp(original)
       .resize({ width: THUMBNAIL_WIDTH_PX, withoutEnlargement: true })
       .toBuffer({ resolveWithObject: true });
-    await createVariant(
+    await upsertVariant(
       media,
       'thumbnail',
       thumbnail.data,
@@ -85,7 +109,7 @@ export async function processImage(job: Job<ImageProcessingJobData>): Promise<vo
     const webp = await sharp(original)
       .webp({ quality: WEBP_QUALITY })
       .toBuffer({ resolveWithObject: true });
-    await createVariant(
+    await upsertVariant(
       media,
       'webp',
       webp.data,
