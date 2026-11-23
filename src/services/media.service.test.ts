@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const MEDIA_ID = 'media-1';
 const USER_ID = 'user-1';
+const THUMBNAIL_KEY = `images/variants/thumbnail/${USER_ID}/${MEDIA_ID}.jpg`;
+const WEBP_KEY = `images/variants/webp/${USER_ID}/${MEDIA_ID}.webp`;
 
 const {
   prismaMock,
@@ -18,6 +20,7 @@ const {
       findUnique: vi.fn(),
       findMany: vi.fn(),
       create: vi.fn(),
+      upsert: vi.fn(),
       deleteMany: vi.fn(),
     },
     artworkMedia: { create: vi.fn() },
@@ -113,6 +116,7 @@ beforeEach(() => {
   prismaMock.media.findUnique.mockResolvedValue(makeMedia());
   prismaMock.media.findMany.mockResolvedValue([]);
   prismaMock.media.create.mockResolvedValue({ id: MEDIA_ID });
+  prismaMock.media.upsert.mockResolvedValue({ id: MEDIA_ID });
   enqueueMock.mockResolvedValue(undefined);
   objectExistsMock.mockResolvedValue(true);
   createPresignedMock.mockResolvedValue('https://s3/upload');
@@ -419,26 +423,28 @@ describe('media worker failure surfacing (#97)', () => {
 
   it('re-throws when sharp conversion fails', async () => {
     const sharpMock = (await import('sharp')).default as unknown as ReturnType<typeof vi.fn>;
-    sharpMock.mockImplementation(() => {
+    // One-shot: `mockImplementation` would leak into every later test in this
+    // file, since `vi.clearAllMocks()` clears calls but not implementations.
+    sharpMock.mockImplementationOnce(() => {
       throw new Error('sharp: unsupported image format');
     });
 
     await expect(processImage(makeJob())).rejects.toThrow('sharp: unsupported image format');
   });
 
-  it('re-throws when variant persistence (prisma.media.create) fails', async () => {
-    prismaMock.media.create.mockRejectedValue(new Error('prisma write failed'));
+  it('re-throws when variant persistence (prisma.media.upsert) fails', async () => {
+    prismaMock.media.upsert.mockRejectedValue(new Error('prisma write failed'));
 
     await expect(processImage(makeJob())).rejects.toThrow('prisma write failed');
   });
 
   it('re-throws when the second variant metadata write fails after the first variant persists', async () => {
-    prismaMock.media.create
+    prismaMock.media.upsert
       .mockResolvedValueOnce({ id: 'thumbnail-1' })
       .mockRejectedValueOnce(new Error('webp metadata write failed'));
 
     await expect(processImage(makeJob())).rejects.toThrow('webp metadata write failed');
-    expect(prismaMock.media.create).toHaveBeenCalledTimes(2);
+    expect(prismaMock.media.upsert).toHaveBeenCalledTimes(2);
   });
 
   it('re-throws when the S3 variant upload fails', async () => {
@@ -462,8 +468,77 @@ describe('media worker failure surfacing (#97)', () => {
   it('completes without throwing on the happy path', async () => {
     await expect(processImage(makeJob())).resolves.toBeUndefined();
 
-    // Both variants created: thumbnail + webp.
-    expect(prismaMock.media.create).toHaveBeenCalledTimes(2);
+    // Both variants persisted: thumbnail + webp.
+    expect(prismaMock.media.upsert).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('media worker retry safety (#96)', () => {
+  it('reprocesses the same job through stable variant keys instead of duplicating rows', async () => {
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+
+    expect(prismaMock.media.create).not.toHaveBeenCalled();
+    expect(prismaMock.media.upsert).toHaveBeenCalledTimes(4);
+
+    const upserts = prismaMock.media.upsert.mock.calls.map(([args]) => args);
+    expect(upserts.map((args) => args.where.key)).toEqual([
+      THUMBNAIL_KEY,
+      WEBP_KEY,
+      THUMBNAIL_KEY,
+      WEBP_KEY,
+    ]);
+
+    // Every attempt targets the same objects, so reprocessing overwrites the
+    // variants rather than accumulating new ones.
+    expect(s3UploadMock.mock.calls.map(([key]) => key)).toEqual([
+      THUMBNAIL_KEY,
+      WEBP_KEY,
+      THUMBNAIL_KEY,
+      WEBP_KEY,
+    ]);
+  });
+
+  it('converges after a partial failure without re-inserting the persisted variant', async () => {
+    prismaMock.media.upsert
+      .mockResolvedValueOnce({ id: 'thumbnail-1' })
+      .mockRejectedValueOnce(new Error('webp metadata write failed'))
+      .mockResolvedValueOnce({ id: 'thumbnail-1' })
+      .mockResolvedValueOnce({ id: 'webp-1' });
+
+    await expect(processImage(makeJob())).rejects.toThrow('webp metadata write failed');
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+
+    expect(prismaMock.media.create).not.toHaveBeenCalled();
+
+    const upserts = prismaMock.media.upsert.mock.calls.map(([args]) => args);
+    expect(upserts).toHaveLength(4);
+    const thumbnailUpserts = upserts.filter((args) => args.where.key === THUMBNAIL_KEY);
+    expect(thumbnailUpserts).toHaveLength(2);
+    // The retry updates the row persisted by the first attempt instead of
+    // inserting a second thumbnail row for the same key.
+    expect(thumbnailUpserts[1]?.update).toMatchObject({
+      variantOfId: MEDIA_ID,
+      variantLabel: 'thumbnail',
+    });
+  });
+
+  it('keeps variant metadata tied to the original media on every attempt', async () => {
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+    await expect(processImage(makeJob())).resolves.toBeUndefined();
+
+    const upserts = prismaMock.media.upsert.mock.calls.map(([args]) => args);
+    const thumbnailUpsert = upserts.find((args) => args.where.key === THUMBNAIL_KEY);
+
+    expect(thumbnailUpsert?.create).toMatchObject({
+      userId: USER_ID,
+      type: 'IMAGE',
+      variantOfId: MEDIA_ID,
+      variantLabel: 'thumbnail',
+      mimeType: 'image/jpeg',
+    });
+    expect(upserts.every((args) => args.update.variantOfId === MEDIA_ID)).toBe(true);
+    expect(upserts.every((args) => args.update.variantLabel !== null)).toBe(true);
   });
 });
 
