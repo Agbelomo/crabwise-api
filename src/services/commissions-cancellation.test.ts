@@ -173,6 +173,17 @@ describe('cancelCommission (#826)', () => {
     expect(txMock.commission.update).not.toHaveBeenCalled();
   });
 
+  it('rejects cancellation by an unrelated user (#73)', async () => {
+    await expect(
+      cancelCommission(COMMISSION_ID, 'unrelated-user', { reason: 'Unauthorized cancellation' }),
+    ).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      message: 'You do not participate in this commission',
+    });
+    expect(txMock.commission.update).not.toHaveBeenCalled();
+    expect(txMock.commissionEvent.create).not.toHaveBeenCalled();
+  });
+
   it('keeps non-participants out', async () => {
     await expect(
       cancelCommission(COMMISSION_ID, 'stranger', { reason: 'Mine now.' }),

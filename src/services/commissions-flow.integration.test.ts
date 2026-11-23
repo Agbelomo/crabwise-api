@@ -243,7 +243,10 @@ function syncReads(): void {
   const state = prismaMock.getState();
   prismaMock.commission.findUnique.mockImplementation(async () => ({ ...state.commission }));
   prismaMock.commissionEvent.findMany.mockImplementation(async () =>
-    [...state.events].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+    [...state.events].sort((a, b) => {
+      const diff = a.createdAt.getTime() - b.createdAt.getTime();
+      return diff !== 0 ? diff : a.id.localeCompare(b.id);
+    }),
   );
   prismaMock.review.findMany.mockImplementation(async () => [...state.reviews]);
   prismaMock.commissionDispute.findUnique.mockImplementation(async () => {
@@ -322,6 +325,55 @@ describe('commission flow: request -> accept -> deliver -> review -> complete (#
     expect(detail.timeline.every((entry, i, all) => i === 0 || entry.at >= all[i - 1]!.at)).toBe(
       true,
     );
+  });
+
+  it('records commission event timestamps consistently and maintains deterministic ordering even with identical timestamps (#74)', async () => {
+    await createCommission(CLIENT_ID, CREATE_INPUT);
+
+    const sameTime = new Date('2026-09-02T12:00:00Z');
+    prismaMock.getState().events = [
+      {
+        id: 'event-1',
+        commissionId: COMMISSION_ID,
+        fromStatus: 'PENDING',
+        toStatus: 'ACCEPTED',
+        actorId: ARTIST_ID,
+        note: null,
+        createdAt: sameTime,
+      },
+      {
+        id: 'event-2',
+        commissionId: COMMISSION_ID,
+        fromStatus: 'ACCEPTED',
+        toStatus: 'IN_PROGRESS',
+        actorId: ARTIST_ID,
+        note: null,
+        createdAt: sameTime,
+      },
+      {
+        id: 'event-3',
+        commissionId: COMMISSION_ID,
+        fromStatus: 'IN_PROGRESS',
+        toStatus: 'DELIVERED',
+        actorId: ARTIST_ID,
+        note: null,
+        createdAt: sameTime,
+      },
+    ];
+
+    const detail = await getCommissionDetail(COMMISSION_ID, CLIENT_ID, 'USER' as Role);
+    expect(detail.timeline.map((entry) => entry.toStatus)).toEqual([
+      'PENDING',
+      'ACCEPTED',
+      'IN_PROGRESS',
+      'DELIVERED',
+    ]);
+    expect(detail.timeline.map((entry) => entry.id)).toEqual([
+      `${COMMISSION_ID}:created`,
+      'event-1',
+      'event-2',
+      'event-3',
+    ]);
   });
 
   it('refuses to complete without the mandatory review', async () => {

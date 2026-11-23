@@ -153,6 +153,21 @@ describe('processCommissionRefund (#874)', () => {
     expect(outcome).toBe('SKIPPED_ALREADY_PROCESSED');
     expect(buildIntentMock).not.toHaveBeenCalled();
     expect(prismaMock.commissionRefund.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.commissionRefund.update).not.toHaveBeenCalled();
+    expect(prismaMock.notification.createMany).not.toHaveBeenCalled();
+  });
+
+  it('reprocessing a completed refund does not issue another payment or change its result (#77)', async () => {
+    prismaMock.commissionRefund.findUnique.mockResolvedValue(
+      makeRefund({ status: 'COMPLETED', xdr: 'already-built-xdr' }),
+    );
+
+    const outcome = await processCommissionRefund(COMMISSION_ID);
+
+    expect(outcome).toBe('SKIPPED_ALREADY_PROCESSED');
+    expect(buildIntentMock).not.toHaveBeenCalled();
+    expect(prismaMock.commissionRefund.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.commissionRefund.update).not.toHaveBeenCalled();
   });
 
   it('loses the claim race gracefully when another worker got there first', async () => {
@@ -198,5 +213,66 @@ describe('processCommissionRefund (#874)', () => {
         }),
       ]),
     });
+  });
+
+  it('avoids marking a refund complete before payment succeeds (#80)', async () => {
+    const callOrder: string[] = [];
+
+    prismaMock.commissionRefund.updateMany.mockImplementation(async () => {
+      callOrder.push('CLAIM_PROCESSING');
+      return { count: 1 };
+    });
+
+    buildIntentMock.mockImplementation(async () => {
+      callOrder.push('BUILD_PAYMENT_INTENT');
+      return {
+        commissionId: COMMISSION_ID,
+        xdr: 'AAAA-encoded-xdr',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+        expiresAt: '2026-10-15T12:00:00.000Z',
+        amount: '450.00',
+        asset: 'USDC',
+        source: 'GESCROW',
+        destination: 'GCLIENT',
+      };
+    });
+
+    prismaMock.commissionRefund.update.mockImplementation(async ({ data }: { data: { status: string } }) => {
+      callOrder.push(`UPDATE_${data.status}`);
+      return makeRefund({ status: data.status });
+    });
+
+    const outcome = await processCommissionRefund(COMMISSION_ID);
+
+    expect(outcome).toBe('COMPLETED');
+    expect(callOrder).toEqual(['CLAIM_PROCESSING', 'BUILD_PAYMENT_INTENT', 'UPDATE_COMPLETED']);
+  });
+
+  it('tests state order around failed payment submission — never marks complete on error (#80)', async () => {
+    const callOrder: string[] = [];
+
+    prismaMock.commissionRefund.updateMany.mockImplementation(async () => {
+      callOrder.push('CLAIM_PROCESSING');
+      return { count: 1 };
+    });
+
+    buildIntentMock.mockImplementation(async () => {
+      callOrder.push('BUILD_PAYMENT_INTENT_FAILED');
+      throw new Error('Horizon submission error');
+    });
+
+    prismaMock.commissionRefund.update.mockImplementation(async ({ data }: { data: { status: string } }) => {
+      callOrder.push(`UPDATE_${data.status}`);
+      return makeRefund({ status: data.status });
+    });
+
+    await expect(processCommissionRefund(COMMISSION_ID)).rejects.toThrow('Horizon submission error');
+
+    expect(callOrder).toEqual(['CLAIM_PROCESSING', 'BUILD_PAYMENT_INTENT_FAILED', 'UPDATE_FAILED']);
+    expect(prismaMock.commissionRefund.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'COMPLETED' }),
+      }),
+    );
   });
 });
