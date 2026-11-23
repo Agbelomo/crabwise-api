@@ -47,6 +47,46 @@ function throwMediaNotFound(): never {
   throw new AppError('NOT_FOUND', 'Media not found');
 }
 
+/**
+ * Magic-byte signatures used to verify file content independently of the
+ * filename extension or the client-declared MIME type. Only types with a
+ * reliable, fixed signature are listed; types without one are rejected by
+ * `assertContentMatchesMime` rather than trusted blindly.
+ */
+const MAGIC_SIGNATURES: Readonly<Record<string, readonly (readonly number[])[]>> = {
+  'image/jpeg': [[0xff, 0xd8, 0xff]],
+  'image/png': [[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  'image/gif': [
+    [0x47, 0x49, 0x46, 0x38, 0x37, 0x61],
+    [0x47, 0x49, 0x46, 0x38, 0x39, 0x61],
+  ],
+  'image/webp': [[0x52, 0x49, 0x46, 0x46]],
+  'application/pdf': [[0x25, 0x50, 0x44, 0x46, 0x2d]],
+  'application/zip': [[0x50, 0x4b, 0x03, 0x04]],
+};
+
+/**
+ * Verifies that the leading bytes of the uploaded object match the signature
+ * of the declared MIME type. Extensions and client-supplied MIME types are
+ * not trusted on their own; the object's actual content decides acceptance.
+ */
+function bytesMatchSignature(bytes: Uint8Array, signatures: readonly (readonly number[])[]): boolean {
+  return signatures.some(
+    (sig) => bytes.length >= sig.length && sig.every((b, i) => bytes[i] === b),
+  );
+}
+
+async function assertContentMatchesMime(key: string, mimeType: string): Promise<void> {
+  const signatures = MAGIC_SIGNATURES[mimeType];
+  if (signatures === undefined) {
+    throw new AppError('UNPROCESSABLE_ENTITY', 'Media content could not be verified for this type');
+  }
+  const head = await readObjectHead(key, 16);
+  if (!bytesMatchSignature(head, signatures)) {
+    throw new AppError('UNPROCESSABLE_ENTITY', 'Uploaded file content does not match its declared type');
+  }
+}
+
 async function assertParentOwnership(
   userId: string,
   parentType: 'ARTWORK' | 'PORTFOLIO',
@@ -220,7 +260,7 @@ export async function confirmMediaUpload(userId: string, mediaId: string): Promi
     throw new AppError('FORBIDDEN', 'You do not own this media');
   }
 
-  if (media.type === 'IMAGE' && media.variantOfId === null) {
+  if (media.variantOfId === null) {
     if (shouldVerifyUploadExists()) {
       let exists: boolean;
       try {
@@ -238,7 +278,20 @@ export async function confirmMediaUpload(userId: string, mediaId: string): Promi
         );
       }
     }
-    await enqueueImageProcessing(media.id);
+
+    // Content validation: the stored bytes, not the extension or declared
+    // MIME type, decide whether this object is accepted.
+    try {
+      await assertContentMatchesMime(media.key, media.mimeType);
+    } catch (err) {
+      await deleteObject(media.bucket, media.key);
+      await prisma.media.deleteMany({ where: { id: media.id } });
+      throw err;
+    }
+
+    if (media.type === 'IMAGE') {
+      await enqueueImageProcessing(media.id);
+    }
   }
 
   return toMediaRecord(media);
