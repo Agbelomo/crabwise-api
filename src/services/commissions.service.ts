@@ -177,6 +177,9 @@ const CLIENT_TRANSITIONS: Partial<Record<CommissionStatus, readonly CommissionSt
 
 const CANCELLABLE_STATUSES: readonly CommissionStatus[] = ['PENDING', 'ACCEPTED', 'IN_PROGRESS'];
 
+/** Final commission states that can no longer transition or be cancelled (#72). */
+export const FINAL_COMMISSION_STATUSES: readonly CommissionStatus[] = ['COMPLETED', 'CANCELLED'];
+
 function assertTransition(
   commission: Commission,
   userId: string,
@@ -191,6 +194,10 @@ function assertTransition(
   }
 
   if (input.status === 'CANCELLED') {
+    // Final-state guard: prevent cancellation after fulfillment (#72).
+    if (commission.status === 'COMPLETED') {
+      throw new AppError('CONFLICT', 'This commission can no longer be cancelled');
+    }
     if (!CANCELLABLE_STATUSES.includes(commission.status)) {
       throw new AppError('CONFLICT', 'This commission can no longer be cancelled');
     }
@@ -624,6 +631,13 @@ export async function cancelCommission(
     const isArtist = commission.artistId === userId;
     if (!isClient && !isArtist) {
       throw new AppError('FORBIDDEN', 'You do not participate in this commission');
+    }
+    // Final-state guard: prevent cancellation after fulfillment (already completed) (#72).
+    if (commission.status === 'COMPLETED') {
+      throw new AppError(
+        'CONFLICT',
+        `This commission can no longer be cancelled (it is ${commission.status})`,
+      );
     }
     if (!CANCELLABLE_STATUSES.includes(commission.status)) {
       throw new AppError(

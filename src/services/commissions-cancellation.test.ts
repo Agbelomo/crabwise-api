@@ -161,6 +161,20 @@ describe('cancelCommission (#826)', () => {
     },
   );
 
+  it('prevents cancellation after fulfillment (final-state guard for completed commissions) (#72)', async () => {
+    txMock.commission.findUnique.mockResolvedValue(makeCommission('COMPLETED'));
+
+    await expect(
+      cancelCommission(COMMISSION_ID, CLIENT_ID, { reason: 'Work has already completed.' }),
+    ).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: 'This commission can no longer be cancelled (it is COMPLETED)',
+    });
+    expect(txMock.commission.update).not.toHaveBeenCalled();
+    expect(txMock.commissionEvent.create).not.toHaveBeenCalled();
+    expect(txMock.notification.createMany).not.toHaveBeenCalled();
+  });
+
   it('refuses to cancel while a dispute holds escrow', async () => {
     txMock.commissionDispute.findFirst.mockResolvedValue({ id: 'dispute-1', status: 'OPEN' });
 

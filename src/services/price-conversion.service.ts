@@ -14,6 +14,8 @@
  * it. Callers see this as a normal "rate unavailable" outcome, not a crash.
  */
 
+import { Prisma } from '@prisma/client';
+
 import { env } from '@/config';
 import { AppError } from '@/middlewares';
 import { logger } from '@/utils';
@@ -21,6 +23,26 @@ import { logger } from '@/utils';
 import { tryGetRedisClient } from './redis.service';
 
 export type PriceAsset = 'XLM' | 'USDC' | 'NGNT' | 'EURC';
+
+/**
+ * Supported currency precision (number of decimal places).
+ * XLM uses 7 decimal places (stroops), while fiat stablecoins (USDC, EURC, NGNT)
+ * use 2 decimal places.
+ */
+export const ASSET_PRECISION: Record<PriceAsset, number> = {
+  XLM: 7,
+  USDC: 2,
+  EURC: 2,
+  NGNT: 2,
+};
+
+export const SUPPORTED_CURRENCY_PRECISION = ASSET_PRECISION;
+
+/**
+ * Rounding mode for price conversion.
+ * Uses ROUND_HALF_UP (standard commercial rounding) to avoid bias and preserve accuracy.
+ */
+export const CONVERSION_ROUNDING_MODE = Prisma.Decimal.ROUND_HALF_UP;
 
 const CACHE_TTL_SECONDS = 5 * 60;
 
@@ -208,6 +230,22 @@ export interface ConversionResult {
 }
 
 /**
+ * Computes converted amount preserving decimal precision and applying the
+ * standard rounding mode (ROUND_HALF_UP) at target currency precision.
+ */
+export function computeConvertedAmount(
+  amount: number,
+  rate: number,
+  targetAsset: PriceAsset,
+): number {
+  const precision = ASSET_PRECISION[targetAsset] ?? 2;
+  return new Prisma.Decimal(amount)
+    .mul(new Prisma.Decimal(rate))
+    .toDecimalPlaces(precision, CONVERSION_ROUNDING_MODE)
+    .toNumber();
+}
+
+/**
  * Converts `amount` of `from` into `to`. Throws `AppError('UNPROCESSABLE_ENTITY', ...)`
  * when no rate is currently available — callers that want a soft fallback
  * (e.g. displaying a price without conversion) should catch this rather
@@ -219,13 +257,13 @@ export async function convertAmount(
   to: PriceAsset,
 ): Promise<ConversionResult> {
   const rate = await getRate(from, to);
-  if (rate === null) {
+  if (rate === null || !Number.isFinite(rate) || rate <= 0) {
     throw new AppError(
       'UNPROCESSABLE_ENTITY',
       `No exchange rate is currently available for ${from} -> ${to}.`,
     );
   }
-  return { amount: amount * rate, rate, from, to };
+  return { amount: computeConvertedAmount(amount, rate, to), rate, from, to };
 }
 
 /**
@@ -239,8 +277,8 @@ export async function tryConvertAmount(
   to: PriceAsset,
 ): Promise<ConversionResult | null> {
   const rate = await getRate(from, to);
-  if (rate === null) {
+  if (rate === null || !Number.isFinite(rate) || rate <= 0) {
     return null;
   }
-  return { amount: amount * rate, rate, from, to };
+  return { amount: computeConvertedAmount(amount, rate, to), rate, from, to };
 }
