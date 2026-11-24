@@ -32,6 +32,10 @@
  * create — or return — a different purchase's order. Payment capture and
  * fulfillment remain out of scope — see `stellar-payment.service` for the
  * payment intent built from a committed order.
+ * This module also owns the order lookup and the purchase settlement
+ * callback: a payment callback settles a PROCESSING order exactly once,
+ * claiming the order and the artwork with conditional updates inside a
+ * single transaction so a lost race leaves no partial state.
  */
 
 import { Prisma, type Artwork, type ArtworkCategory, type Asset, type Order } from '@prisma/client';
@@ -433,4 +437,119 @@ export async function createOrder(buyerId: string, input: CreateOrderInput): Pro
       throw err;
     }
   }
+/**
+ * The only order state a purchase callback may settle from.
+ *
+ * Matches the schema's `PENDING → PROCESSING → COMPLETED` machine: PROCESSING
+ * means payment has been observed, so completing straight from PENDING (or
+ * reviving a FAILED/REFUNDED order) is rejected rather than skipping a step.
+ */
+const SETTLEABLE_ORDER_STATUS = 'PROCESSING';
+
+export interface PurchaseCallbackResult {
+  readonly order: Order;
+  /** True when the callback repeated an already-settled purchase. */
+  readonly duplicate: boolean;
+}
+
+function orderNotFound(): AppError {
+  return new AppError('NOT_FOUND', 'Order not found');
+}
+
+function isRecordNotFound(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025';
+}
+
+/**
+ * Fetches an order by id. An unknown identifier (or a row removed between the
+ * lookup and the read) becomes the stable NOT_FOUND error, while any other
+ * failure is rethrown untouched so callers can tell a missing order apart from
+ * an infrastructure problem (#57).
+ */
+export async function getMarketplaceOrder(orderId: string): Promise<Order> {
+  try {
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
+    if (order === null) {
+      throw orderNotFound();
+    }
+    return order;
+  } catch (err) {
+    if (isRecordNotFound(err)) {
+      throw orderNotFound();
+    }
+    throw err;
+  }
+}
+
+/**
+ * Settles a purchase once its payment has been observed (PROCESSING →
+ * COMPLETED): completes the order, marks the artwork sold, and writes the
+ * buyer's PURCHASE ledger entry.
+ *
+ * Every write happens inside one transaction, and the order and artwork are
+ * claimed with conditional updates. If either claim loses a race (another
+ * callback already completed the order, or another order sold the artwork),
+ * the method throws and the transaction rolls back, so a failed conditional
+ * update never leaves the order, artwork, or ledger half-updated (#59).
+ *
+ * A repeat callback for an already-completed order is a no-op that reports
+ * `duplicate: true`; the artwork flag and ledger row are only written on the
+ * first settlement (#56).
+ */
+export async function completeMarketplacePurchase(
+  orderId: string,
+  txHash: string,
+): Promise<PurchaseCallbackResult> {
+  return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    const order = await tx.order.findUnique({ where: { id: orderId } });
+    if (order === null) {
+      throw orderNotFound();
+    }
+
+    // Replayed callback: the purchase is already settled, so report the
+    // existing order without running any side effect a second time.
+    if (order.status === 'COMPLETED') {
+      return { order, duplicate: true };
+    }
+
+    if (order.status !== SETTLEABLE_ORDER_STATUS) {
+      throw new AppError('CONFLICT', `Cannot complete an order in ${order.status} state`);
+    }
+
+    // Claim the order only while it is still PROCESSING. A concurrent callback
+    // that won the race makes this a no-op instead of completing twice.
+    const claimed = await tx.order.updateMany({
+      where: { id: orderId, status: SETTLEABLE_ORDER_STATUS },
+      data: { status: 'COMPLETED', txHash },
+    });
+    if (claimed.count === 0) {
+      throw new AppError('CONFLICT', 'Order was already settled by another request');
+    }
+
+    // An artwork can only be sold once. If a competing order sold it first,
+    // throwing here rolls back the order claim above.
+    const reserved = await tx.artwork.updateMany({
+      where: { id: order.artworkId, sold: false },
+      data: { sold: true },
+    });
+    if (reserved.count === 0) {
+      throw new AppError('CONFLICT', 'Artwork is no longer available for purchase');
+    }
+
+    await tx.transaction.create({
+      data: {
+        orderId: order.id,
+        userId: order.buyerId,
+        type: 'PURCHASE',
+        amount: order.amount,
+        asset: order.asset,
+        txHash,
+        network: env.stellarNetwork,
+        confirmed: true,
+      },
+    });
+
+    const settled: Order = { ...order, status: 'COMPLETED', txHash };
+    return { order: settled, duplicate: false };
+  });
 }

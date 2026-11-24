@@ -275,6 +275,12 @@ export async function createOrderPaymentIntent(
   }
 
   const { legs, destination } = await buildPlan(order);
+  if (legs.some((leg) => leg.destination === buyerWallet.publicKey)) {
+    throw new AppError(
+      'UNPROCESSABLE_ENTITY',
+      'A payment cannot be sent to your own Stellar account',
+    );
+  }
   const asset = assetFor(order.asset);
 
   const sequence = await fetchSequenceNumber(fetchImpl, buyerWallet.publicKey, horizonUrl());
