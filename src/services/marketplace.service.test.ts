@@ -3,14 +3,21 @@
  * browse-result caching, and price conversion accuracy.
  */
 
+import { Prisma } from '@prisma/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AppError } from '@/middlewares';
 
-const { prismaMock, redisMock, tryGetRedisClientMock } = vi.hoisted(() => {
+const { prismaMock, txMock, redisMock, tryGetRedisClientMock } = vi.hoisted(() => {
+  const tx = {
+    artwork: { findUnique: vi.fn() },
+    order: { findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn() },
+  };
   const prisma = {
     artwork: { findMany: vi.fn(), updateMany: vi.fn() },
     artistProfile: { findMany: vi.fn() },
+    order: { findUnique: vi.fn() },
+    $transaction: vi.fn(async (callback: (client: unknown) => Promise<unknown>) => callback(tx)),
     order: { findUnique: vi.fn(), updateMany: vi.fn() },
     transaction: { create: vi.fn() },
     $transaction: vi.fn(),
@@ -22,12 +29,18 @@ const { prismaMock, redisMock, tryGetRedisClientMock } = vi.hoisted(() => {
     zincrby: vi.fn(),
     zrevrange: vi.fn(),
   };
-  return { prismaMock: prisma, redisMock: redis, tryGetRedisClientMock: vi.fn() };
+  return {
+    prismaMock: prisma,
+    txMock: tx,
+    redisMock: redis,
+    tryGetRedisClientMock: vi.fn(),
+  };
 });
 
 vi.mock('@/services', () => ({ prisma: prismaMock }));
 vi.mock('./redis.service', () => ({ tryGetRedisClient: tryGetRedisClientMock }));
 
+import { browseArtworks, createOrder, listTrendingArtworks } from './marketplace.service';
 import {
   browseArtworks,
   completeMarketplacePurchase,
@@ -355,6 +368,199 @@ describe('verifiedOnly filter with caching (#865)', () => {
         where: expect.objectContaining({ userId: { in: ['artist-a'] } }),
       }),
     );
+  });
+});
+
+describe('marketplace purchase creation (#51-#54)', () => {
+  const BUYER_ID = 'buyer-1';
+  const SELLER_ID = 'seller-1';
+  const ARTWORK_ID = 'artwork-1';
+
+  function makeArtwork(overrides: Record<string, unknown> = {}) {
+    return {
+      id: ARTWORK_ID,
+      userId: SELLER_ID,
+      title: 'Sunset over the bay',
+      published: true,
+      sold: false,
+      price: new Prisma.Decimal('100.00'),
+      asset: 'USDC',
+      ...overrides,
+    };
+  }
+
+  function makeOrder(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'order-1',
+      buyerId: BUYER_ID,
+      sellerId: SELLER_ID,
+      artworkId: ARTWORK_ID,
+      amount: new Prisma.Decimal('100.00'),
+      asset: 'USDC',
+      platformFee: new Prisma.Decimal('5.00'),
+      status: 'PENDING',
+      idempotencyKey: null,
+      txHash: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+      ...overrides,
+    };
+  }
+
+  function uniqueViolation(): Prisma.PrismaClientKnownRequestError {
+    return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+      code: 'P2002',
+      clientVersion: 'test',
+    });
+  }
+
+  function transactionConflict(): Prisma.PrismaClientKnownRequestError {
+    return new Prisma.PrismaClientKnownRequestError('Transaction conflict', {
+      code: 'P2034',
+      clientVersion: 'test',
+    });
+  }
+
+  beforeEach(() => {
+    txMock.artwork.findUnique.mockResolvedValue(makeArtwork());
+    txMock.order.findUnique.mockResolvedValue(null);
+    txMock.order.findFirst.mockResolvedValue(null);
+    txMock.order.create.mockResolvedValue(makeOrder());
+    prismaMock.order.findUnique.mockResolvedValue(null);
+  });
+
+  describe('#51 idempotent purchase creation', () => {
+    it('creates one order and returns it for every repeat of the same key', async () => {
+      const first = await createOrder(BUYER_ID, {
+        artworkId: ARTWORK_ID,
+        idempotencyKey: 'checkout-1',
+      });
+
+      txMock.order.findUnique.mockResolvedValueOnce(makeOrder({ idempotencyKey: 'checkout-1' }));
+      const second = await createOrder(BUYER_ID, {
+        artworkId: ARTWORK_ID,
+        idempotencyKey: 'checkout-1',
+      });
+
+      expect(txMock.order.create).toHaveBeenCalledTimes(1);
+      expect(second.order.id).toBe(first.order.id);
+    });
+
+    it('returns the winning order when a concurrent retry hits the unique index', async () => {
+      txMock.order.create.mockRejectedValueOnce(uniqueViolation());
+      prismaMock.order.findUnique.mockResolvedValueOnce(
+        makeOrder({ idempotencyKey: 'checkout-1' }),
+      );
+
+      const result = await createOrder(BUYER_ID, {
+        artworkId: ARTWORK_ID,
+        idempotencyKey: 'checkout-1',
+      });
+
+      expect(result.order.id).toBe('order-1');
+      expect(result.total).toBe('105.00');
+    });
+
+    it('still rejects a second order for the same artwork when no key is supplied', async () => {
+      txMock.order.findFirst.mockResolvedValueOnce(makeOrder());
+
+      await expect(createOrder(BUYER_ID, { artworkId: ARTWORK_ID })).rejects.toMatchObject({
+        code: 'CONFLICT',
+      });
+      expect(txMock.order.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('#52 idempotency key reuse for different purchase data', () => {
+    it('rejects a key already used for another artwork', async () => {
+      txMock.order.findUnique.mockResolvedValueOnce(
+        makeOrder({ artworkId: 'another-artwork', idempotencyKey: 'checkout-1' }),
+      );
+
+      await expect(
+        createOrder(BUYER_ID, { artworkId: ARTWORK_ID, idempotencyKey: 'checkout-1' }),
+      ).rejects.toMatchObject({ code: 'CONFLICT' });
+      expect(txMock.order.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a mismatched key on the concurrent-retry path instead of returning that order', async () => {
+      txMock.order.create.mockRejectedValueOnce(uniqueViolation());
+      prismaMock.order.findUnique.mockResolvedValueOnce(
+        makeOrder({ artworkId: 'another-artwork', idempotencyKey: 'checkout-1' }),
+      );
+
+      await expect(
+        createOrder(BUYER_ID, { artworkId: ARTWORK_ID, idempotencyKey: 'checkout-1' }),
+      ).rejects.toMatchObject({ code: 'CONFLICT' });
+    });
+  });
+
+  describe('#53 availability inside the purchase transaction', () => {
+    it.each([
+      ['sold', { sold: true }],
+      ['unpublished', { published: false }],
+      ['unpriced', { price: null }],
+    ])('refuses %s artwork', async (_label, overrides) => {
+      txMock.artwork.findUnique.mockResolvedValueOnce(makeArtwork(overrides));
+
+      await expect(createOrder(BUYER_ID, { artworkId: ARTWORK_ID })).rejects.toMatchObject({
+        code: 'UNPROCESSABLE_ENTITY',
+      });
+      expect(txMock.order.create).not.toHaveBeenCalled();
+    });
+
+    it('checks availability and writes the order in one serialisable transaction', async () => {
+      await createOrder(BUYER_ID, { artworkId: ARTWORK_ID });
+
+      expect(prismaMock.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+      });
+      expect(txMock.artwork.findUnique).toHaveBeenCalledWith({ where: { id: ARTWORK_ID } });
+      expect(txMock.order.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          buyerId: BUYER_ID,
+          sellerId: SELLER_ID,
+          artworkId: ARTWORK_ID,
+          amount: new Prisma.Decimal('100.00'),
+          platformFee: new Prisma.Decimal('5.00'),
+        }),
+      });
+    });
+
+    it('retries a serialisation conflict and then sees the winning duplicate order', async () => {
+      prismaMock.$transaction.mockRejectedValueOnce(transactionConflict());
+      txMock.order.findFirst.mockResolvedValueOnce(makeOrder());
+
+      await expect(createOrder(BUYER_ID, { artworkId: ARTWORK_ID })).rejects.toMatchObject({
+        code: 'CONFLICT',
+      });
+      expect(prismaMock.$transaction).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('#54 order creation rolls back as a unit', () => {
+    it('propagates a failure after the availability check without returning a partial order', async () => {
+      txMock.order.create.mockRejectedValueOnce(new Error('payment preparation failed'));
+
+      await expect(
+        createOrder(BUYER_ID, { artworkId: ARTWORK_ID, idempotencyKey: 'checkout-1' }),
+      ).rejects.toThrow('payment preparation failed');
+      expect(prismaMock.$transaction).toHaveBeenCalledTimes(1);
+      expect(txMock.order.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after repeated transaction conflicts and writes nothing', async () => {
+      prismaMock.$transaction
+        .mockRejectedValueOnce(transactionConflict())
+        .mockRejectedValueOnce(transactionConflict())
+        .mockRejectedValueOnce(transactionConflict());
+
+      await expect(createOrder(BUYER_ID, { artworkId: ARTWORK_ID })).rejects.toMatchObject({
+        code: 'P2034',
+      });
+      expect(prismaMock.$transaction).toHaveBeenCalledTimes(3);
+      expect(txMock.order.create).not.toHaveBeenCalled();
+    });
   });
 });
 

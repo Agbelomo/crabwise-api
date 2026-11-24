@@ -1,11 +1,11 @@
 /**
- * Marketplace browse service.
+ * Marketplace browse and purchase service.
  *
- * Only published, unsold artworks are ever surfaced here — this is a
- * discovery surface, not an owner-management one (see `artworks.service`
- * for that). Browse results are cached in Redis for a short TTL
- * (cache-aside: read through on a miss, write on the way out) since this is
- * the highest-traffic read path in the API; caching degrades to a no-op
+ * Browse/discovery: only published, unsold artworks are ever surfaced here —
+ * this is a discovery surface, not an owner-management one (see
+ * `artworks.service` for that). Browse results are cached in Redis for a short
+ * TTL (cache-aside: read through on a miss, write on the way out) since this
+ * is the highest-traffic read path in the API; caching degrades to a no-op
  * when Redis isn't configured.
  *
  * `trending` and `recommended` both rank by the same weighted trending
@@ -25,6 +25,13 @@
  * produced it. Offset pages can shift if artworks are published between
  * requests; the 30-second cache bounds how often that is visible.
  *
+ * Purchase (`createOrder`): creates the PENDING order that starts a purchase.
+ * Availability, duplicate-order detection, idempotency and the order write all
+ * happen in one serialisable transaction, so availability cannot change
+ * between the check and the order write and a retried request can never
+ * create — or return — a different purchase's order. Payment capture and
+ * fulfillment remain out of scope — see `stellar-payment.service` for the
+ * payment intent built from a committed order.
  * This module also owns the order lookup and the purchase settlement
  * callback: a payment callback settles a PROCESSING order exactly once,
  * claiming the order and the artwork with conditional updates inside a
@@ -36,6 +43,7 @@ import { Prisma, type Artwork, type ArtworkCategory, type Asset, type Order } fr
 import { env } from '@/config';
 import { AppError } from '@/middlewares';
 import { prisma } from '@/services';
+import { calculatePlatformFee } from '@/utils/fee';
 import { stableStringify } from '@/utils/stable-json';
 
 import { cached } from './cache.service';
@@ -279,6 +287,156 @@ export async function getRecommendedArtworks(): Promise<readonly Artwork[]> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Purchase creation
+// ---------------------------------------------------------------------------
+
+export interface CreateOrderInput {
+  readonly artworkId: string;
+  readonly idempotencyKey?: string;
+}
+
+export interface OrderSummary {
+  readonly order: Order;
+  readonly total: string;
+}
+
+/** Order statuses that mean "this purchase already exists" — a new attempt
+ * for the same buyer/artwork is rejected rather than creating a second order.
+ * FAILED/REFUNDED orders don't block a retry. */
+const BLOCKING_STATUSES = ['PENDING', 'PROCESSING', 'COMPLETED'] as const;
+
+/** A serialisable transaction can lose a write race; retry it so the second
+ * attempt sees the winning order (and returns/rejects accordingly) instead of
+ * surfacing a deadlock to the client. */
+const PURCHASE_ATTEMPTS = 3;
+
+function isUniqueViolation(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002';
+}
+
+function isTransactionConflict(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034';
+}
+
+function toSummary(order: Order): OrderSummary {
+  return { order, total: order.amount.add(order.platformFee).toFixed(2) };
+}
+
+/**
+ * A reused idempotency key must identify the same purchase. Returning `raced`
+ * blindly would hand the buyer an unrelated order when the key was first used
+ * for a different artwork, so compare the stored order to the request first
+ * (#52).
+ */
+function assertSamePurchase(order: Order, artworkId: string): void {
+  if (order.artworkId !== artworkId) {
+    throw new AppError('CONFLICT', 'Idempotency key was already used for a different purchase');
+  }
+}
+
+/**
+ * Creates the PENDING order that initiates a purchase.
+ *
+ * Idempotency: when `idempotencyKey` is supplied, a repeat request returns the
+ * order created by the first one instead of creating another (#51). The key is
+ * scoped to the buyer by the database's `(buyerId, idempotencyKey)` unique
+ * index; reusing it for another artwork is rejected rather than returning that
+ * unrelated order (#52), including on the concurrent-retry path where the
+ * unique index is what detects the repeat.
+ *
+ * Availability is re-read inside the purchase transaction (#53) and the
+ * transaction is serialisable, so a concurrent sale cannot make that check
+ * stale before the order commits; a lost write race is retried and then
+ * resolved against the winning state. The order write is part of that
+ * transaction too: if anything fails before commit — including preparing the
+ * order's payment data — there is no partial order to roll back (#54). Payment
+ * intents are deliberately built later from the committed order in a separate
+ * request (see `stellar-payment.service`).
+ */
+export async function createOrder(buyerId: string, input: CreateOrderInput): Promise<OrderSummary> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const order = await prisma.$transaction(
+        async (tx) => {
+          // Resolve an idempotent repeat before touching the artwork: a retry
+          // is answered from the original order even if the artwork has since
+          // been sold or unpublished.
+          if (input.idempotencyKey !== undefined) {
+            const existing = await tx.order.findUnique({
+              where: {
+                buyerId_idempotencyKey: { buyerId, idempotencyKey: input.idempotencyKey },
+              },
+            });
+            if (existing !== null) {
+              assertSamePurchase(existing, input.artworkId);
+              return existing;
+            }
+          }
+
+          const artwork = await tx.artwork.findUnique({ where: { id: input.artworkId } });
+          if (artwork === null) {
+            throw new AppError('NOT_FOUND', 'Artwork not found');
+          }
+          if (artwork.userId === buyerId) {
+            throw new AppError('FORBIDDEN', 'You cannot purchase your own artwork');
+          }
+          // Availability is checked here, inside the transaction, so it cannot
+          // go stale between the check and the order insert (#53).
+          if (!artwork.published || artwork.sold) {
+            throw new AppError('UNPROCESSABLE_ENTITY', 'Artwork is not available for purchase');
+          }
+          if (artwork.price === null || artwork.asset === null) {
+            throw new AppError('UNPROCESSABLE_ENTITY', 'Artwork has no price set');
+          }
+
+          const duplicate = await tx.order.findFirst({
+            where: {
+              buyerId,
+              artworkId: artwork.id,
+              status: { in: [...BLOCKING_STATUSES] },
+            },
+          });
+          if (duplicate !== null) {
+            throw new AppError('CONFLICT', 'You already have an order for this artwork');
+          }
+
+          const platformFee = calculatePlatformFee(artwork.price, env.platformFeeBps);
+
+          return tx.order.create({
+            data: {
+              buyerId,
+              sellerId: artwork.userId,
+              artworkId: artwork.id,
+              amount: artwork.price,
+              asset: artwork.asset,
+              platformFee,
+              idempotencyKey: input.idempotencyKey,
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+      return toSummary(order);
+    } catch (err) {
+      if (isTransactionConflict(err) && attempt < PURCHASE_ATTEMPTS) {
+        continue;
+      }
+      // A concurrent request with the same idempotency key won the race —
+      // return its order (after confirming it is the same purchase) instead
+      // of failing this one.
+      if (input.idempotencyKey !== undefined && isUniqueViolation(err)) {
+        const raced = await prisma.order.findUnique({
+          where: { buyerId_idempotencyKey: { buyerId, idempotencyKey: input.idempotencyKey } },
+        });
+        if (raced !== null) {
+          assertSamePurchase(raced, input.artworkId);
+          return toSummary(raced);
+        }
+      }
+      throw err;
+    }
+  }
 /**
  * The only order state a purchase callback may settle from.
  *
