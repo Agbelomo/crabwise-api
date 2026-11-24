@@ -7,6 +7,7 @@
  */
 
 import { env } from '@/config';
+import { AppError } from '@/middlewares';
 import { logger } from '@/utils';
 import { prisma } from '@/services';
 
@@ -19,11 +20,17 @@ export interface RefreshTokenCleanupStats {
 export async function cleanupRefreshTokens(now: Date = new Date()): Promise<RefreshTokenCleanupStats> {
   const revokedCutoff = new Date(now.getTime() - env.revokedTokenRetentionDays * DAY_MS);
 
-  const { count } = await prisma.refreshToken.deleteMany({
-    where: {
-      OR: [{ expiresAt: { lt: now } }, { revokedAt: { not: null, lt: revokedCutoff } }],
-    },
-  });
+  let count: number;
+  try {
+    const result = await prisma.refreshToken.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lt: now } }, { revokedAt: { not: null, lt: revokedCutoff } }],
+      },
+    });
+    count = result.count;
+  } catch (err) {
+    throw new AppError('INTERNAL_ERROR', 'Refresh-token cleanup failed', { cause: err });
+  }
 
   logger.info('refresh-token-cleanup: run complete', { deleted: count });
   return { deleted: count };
