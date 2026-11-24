@@ -70,6 +70,14 @@ function makeArtwork(overrides: Partial<Record<string, unknown>> = {}) {
   };
 }
 
+/** The error Prisma raises when the row a write targets no longer exists. */
+function recordNotFound(): Prisma.PrismaClientKnownRequestError {
+  return new Prisma.PrismaClientKnownRequestError('Record to update not found.', {
+    code: 'P2025',
+    clientVersion: 'test',
+  });
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -412,6 +420,45 @@ describe('deleteArtwork', () => {
   });
 });
 
+describe('artworks removed between lookup and write', () => {
+  it('returns NOT_FOUND when an artwork disappears before an update is written', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork());
+    prismaMock.artwork.update.mockRejectedValue(recordNotFound());
+
+    await expect(updateArtwork(OWNER_ID, ARTWORK_ID, { title: 'New title' })).rejects.toMatchObject(
+      {
+        code: 'NOT_FOUND',
+      },
+    );
+    expect(invalidateNamespaceMock).not.toHaveBeenCalled();
+  });
+
+  it('returns NOT_FOUND when an artwork disappears before publish state is written', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: true }));
+    prismaMock.artwork.update.mockRejectedValue(recordNotFound());
+
+    await expect(setArtworkPublished(OWNER_ID, ARTWORK_ID, false)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(invalidateNamespaceMock).not.toHaveBeenCalled();
+  });
+
+  it('returns NOT_FOUND when an artwork disappears before it is deleted', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork());
+    prismaMock.artwork.delete.mockRejectedValue(recordNotFound());
+
+    await expect(deleteArtwork(OWNER_ID, ARTWORK_ID)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(invalidateNamespaceMock).not.toHaveBeenCalled();
+  });
+
+  it('does not translate unrelated database failures into not-found', async () => {
+    const failure = new Error('connection terminated unexpectedly');
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork());
+    prismaMock.artwork.update.mockRejectedValue(failure);
+
+    await expect(updateArtwork(OWNER_ID, ARTWORK_ID, { title: 'New title' })).rejects.toBe(failure);
 describe('getArtworkDetail — relation consistency (#50)', () => {
   beforeEach(() => {
     prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: true }));
