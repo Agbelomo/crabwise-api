@@ -37,6 +37,11 @@ export interface SearchPage {
 
 const SEARCH_CACHE_TTL_SECONDS = 60;
 const TRIGRAM_SIMILARITY_THRESHOLD = 0.2;
+const SEARCH_WILDCARD_PATTERN = /[%_*\\]+/g;
+
+function normalizeSearchTerm(q: string): string {
+  return q.replace(SEARCH_WILDCARD_PATTERN, ' ').replace(/\s+/g, ' ').trim();
+}
 
 function buildFilterSql(filters: SearchFilters): Prisma.Sql {
   if (filters.category === undefined) {
@@ -120,7 +125,7 @@ export async function searchArtworks(
   page: number,
   limit: number,
 ): Promise<SearchPage> {
-  const trimmed = q.trim();
+  const trimmed = normalizeSearchTerm(q);
   if (trimmed === '') {
     return { items: [], page, limit, total: 0, hasNext: false };
   }
