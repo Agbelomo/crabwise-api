@@ -24,7 +24,14 @@ vi.mock('@/config', () => ({ env: envMock }));
 vi.mock('@/utils', () => ({ logger: loggerMock }));
 vi.mock('./redis.service', () => ({ tryGetRedisClient: () => redisMock }));
 
-import { convertAmount, getPriceConversionMetrics, getRate } from './price-conversion.service';
+import {
+  ASSET_PRECISION,
+  CONVERSION_ROUNDING_MODE,
+  convertAmount,
+  getPriceConversionMetrics,
+  getRate,
+  tryConvertAmount,
+} from './price-conversion.service';
 
 const originalFetch = global.fetch;
 
@@ -130,5 +137,163 @@ describe('price conversion observability (#871)', () => {
     await expect(convertAmount(10, 'XLM', 'USDC')).rejects.toMatchObject({
       code: 'UNPROCESSABLE_ENTITY',
     });
+  });
+});
+
+describe('preserve decimal precision in price conversion (#62)', () => {
+  it('preserves precision for fractional amounts without floating-point artifacts', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [{ price: '0.2' }], asks: [{ price: '0.2' }] }),
+    }) as unknown as typeof fetch;
+
+    const result = await convertAmount(0.1, 'XLM', 'USDC');
+    expect(result.amount).toBe(0.02);
+    expect(result.rate).toBe(0.2);
+  });
+
+  it('preserves fractional precision for high-precision target asset (XLM 7 decimals)', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [{ price: '1.5' }], asks: [{ price: '1.5' }] }),
+    }) as unknown as typeof fetch;
+
+    const result = await convertAmount(0.0000002, 'USDC', 'XLM');
+    expect(result.amount).toBe(0.0000003);
+  });
+
+  it('preserves precision for large amounts without precision loss', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [{ price: '1.25' }], asks: [{ price: '1.25' }] }),
+    }) as unknown as typeof fetch;
+
+    const largeAmount = 100_000_000.5;
+    const result = await convertAmount(largeAmount, 'XLM', 'USDC');
+    expect(result.amount).toBe(125000000.63);
+  });
+
+  it('preserves precision when tryConvertAmount is used with fractional and large amounts', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [{ price: '0.07' }], asks: [{ price: '0.07' }] }),
+    }) as unknown as typeof fetch;
+
+    const fractional = await tryConvertAmount(0.1, 'XLM', 'USDC');
+    expect(fractional).not.toBeNull();
+    expect(fractional?.amount).toBe(0.01);
+
+    const large = await tryConvertAmount(1_000_000_000, 'XLM', 'USDC');
+    expect(large).not.toBeNull();
+    expect(large?.amount).toBe(70000000);
+  });
+});
+
+describe('handle missing exchange-rate data (#63)', () => {
+  it('surfaces unavailable rate explicitly with UNPROCESSABLE_ENTITY and does not fabricate a price in convertAmount', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [], asks: [] }),
+    }) as unknown as typeof fetch;
+
+    await expect(convertAmount(100, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'UNPROCESSABLE_ENTITY',
+      message: 'No exchange rate is currently available for XLM -> USDC.',
+    });
+  });
+
+  it('avoids fabricating a converted price and returns null in tryConvertAmount when order book is empty', async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ bids: [], asks: [] }),
+    }) as unknown as typeof fetch;
+
+    const result = await tryConvertAmount(100, 'XLM', 'USDC');
+    expect(result).toBeNull();
+  });
+
+  it('surfaces unavailable rate when Horizon network call fails, avoiding fallback fabrication', async () => {
+    global.fetch = vi.fn().mockRejectedValue(new Error('Network offline')) as unknown as typeof fetch;
+
+    await expect(convertAmount(50, 'XLM', 'USDC')).rejects.toMatchObject({
+      code: 'UNPROCESSABLE_ENTITY',
+    });
+    const result = await tryConvertAmount(50, 'XLM', 'USDC');
+    expect(result).toBeNull();
+  });
+
+  it('surfaces unavailable rate when asset issuer is not configured, avoiding fabricated rate', async () => {
+    envMock.priceAssetIssuers.NGNT = undefined;
+
+    await expect(convertAmount(50, 'NGNT', 'USDC')).rejects.toMatchObject({
+      code: 'UNPROCESSABLE_ENTITY',
+      message: 'No exchange rate is currently available for NGNT -> USDC.',
+    });
+    const result = await tryConvertAmount(50, 'NGNT', 'USDC');
+    expect(result).toBeNull();
+  });
+});
+
+describe('conversion rounding rules (#64)', () => {
+  it('specifies expected currency precision for all supported assets', () => {
+    expect(ASSET_PRECISION.XLM).toBe(7);
+    expect(ASSET_PRECISION.USDC).toBe(2);
+    expect(ASSET_PRECISION.EURC).toBe(2);
+    expect(ASSET_PRECISION.NGNT).toBe(2);
+    expect(CONVERSION_ROUNDING_MODE).toBeDefined();
+  });
+
+  it('rounds half up at 2 decimal places for fiat/stablecoin currencies (USDC, EURC, NGNT)', async () => {
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ bids: [{ price: '0.1004' }], asks: [{ price: '0.1004' }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ bids: [{ price: '0.1005' }], asks: [{ price: '0.1005' }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ bids: [{ price: '0.1006' }], asks: [{ price: '0.1006' }] }),
+      }) as unknown as typeof fetch;
+
+    const roundDown = await convertAmount(10, 'XLM', 'USDC');
+    expect(roundDown.amount).toBe(1.00);
+
+    const roundHalfUp = await convertAmount(10, 'XLM', 'USDC');
+    expect(roundHalfUp.amount).toBe(1.01);
+
+    const roundUp = await convertAmount(10, 'XLM', 'USDC');
+    expect(roundUp.amount).toBe(1.01);
+  });
+
+  it('rounds half up at 7 decimal places for XLM', async () => {
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ bids: [{ price: '0.12345674' }], asks: [{ price: '0.12345674' }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ bids: [{ price: '0.12345675' }], asks: [{ price: '0.12345675' }] }),
+      }) as unknown as typeof fetch;
+
+    const roundDown = await convertAmount(1, 'USDC', 'XLM');
+    expect(roundDown.amount).toBe(0.1234567);
+
+    const roundHalfUp = await convertAmount(1, 'USDC', 'XLM');
+    expect(roundHalfUp.amount).toBe(0.1234568);
   });
 });
