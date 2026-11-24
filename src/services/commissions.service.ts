@@ -375,7 +375,7 @@ export async function getCommissionDetail(
   const [events, deliverables, reviews, dispute, parties] = await Promise.all([
     prisma.commissionEvent.findMany({
       where: { commissionId },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     }),
     // Submissions carry their attached media, so the client can review the
     // files on the version it is being asked to accept (#784).
@@ -409,7 +409,13 @@ export async function getCommissionDetail(
       at: event.createdAt,
     })),
   ];
-  timeline.sort((a, b) => a.at.getTime() - b.at.getTime());
+  timeline.sort((a, b) => {
+    const diff = a.at.getTime() - b.at.getTime();
+    if (diff !== 0) return diff;
+    if (a.type === 'CREATED') return -1;
+    if (b.type === 'CREATED') return 1;
+    return a.id.localeCompare(b.id);
+  });
 
   return {
     commission,
