@@ -23,6 +23,7 @@ import {
   Memo,
   Networks,
   Operation,
+  StrKey,
   TransactionBuilder,
 } from '@stellar/stellar-sdk';
 import type { Order } from '@prisma/client';
@@ -275,6 +276,10 @@ export async function createOrderPaymentIntent(
   }
 
   const { legs, destination } = await buildPlan(order);
+  for (const leg of legs) {
+    if (!StrKey.isValidEd25519PublicKey(leg.destination)) {
+      throw new AppError('UNPROCESSABLE_ENTITY', 'Invalid Stellar destination address in the payment plan');
+    }
   if (legs.some((leg) => leg.destination === buyerWallet.publicKey)) {
     throw new AppError(
       'UNPROCESSABLE_ENTITY',
