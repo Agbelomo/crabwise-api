@@ -51,11 +51,13 @@ export async function verifySignature(
   assertValidPublicKey(publicKey);
 
   const record = await prisma.stellarNonce.findUnique({ where: { nonce } });
+  const now = new Date();
   if (
     record === null ||
     record.publicKey !== publicKey ||
     record.consumed ||
-    record.expiresAt <= new Date()
+    record.expiresAt <= now ||
+    record.createdAt > now
   ) {
     throw new AppError('UNAUTHORIZED', 'Invalid or expired nonce');
   }
