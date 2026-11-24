@@ -15,6 +15,7 @@ import type { User } from '@prisma/client';
 import { env } from '@/config';
 import { AppError } from '@/middlewares';
 import { prisma } from '@/services';
+import { logger } from '@/utils';
 import { hashPassword } from '@/utils/password';
 import { toPublicUser, uniqueUsername } from './auth.service';
 import { issueTokenPair, type TokenPair } from './token.service';
@@ -65,7 +66,10 @@ export async function verifySignature(
       Buffer.from(nonce, 'utf8'),
       Buffer.from(signature, 'base64'),
     );
-  } catch {
+  } catch (err) {
+    logger.warn('stellar-auth: signature verification provider error', {
+      errorType: err instanceof Error ? err.name : 'UnknownError',
+    });
     valid = false;
   }
   if (!valid) {
