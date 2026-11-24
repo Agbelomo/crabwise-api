@@ -280,6 +280,11 @@ export async function createOrderPaymentIntent(
     if (!StrKey.isValidEd25519PublicKey(leg.destination)) {
       throw new AppError('UNPROCESSABLE_ENTITY', 'Invalid Stellar destination address in the payment plan');
     }
+  if (legs.some((leg) => leg.destination === buyerWallet.publicKey)) {
+    throw new AppError(
+      'UNPROCESSABLE_ENTITY',
+      'A payment cannot be sent to your own Stellar account',
+    );
   }
   const asset = assetFor(order.asset);
 
