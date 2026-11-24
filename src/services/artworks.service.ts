@@ -301,12 +301,20 @@ export async function getArtworkDetail(
 ): Promise<ArtworkDetail> {
   const artwork = await getArtworkById(artworkId);
 
+  // Public detail is a discovery surface like the listing endpoints, so it
+  // applies the same visibility rule: an unpublished draft or an artwork that
+  // has already been sold is reported as not found rather than exposed (#45).
+  if (!artwork.published || artwork.sold) {
+    throw new AppError('NOT_FOUND', 'Artwork not found');
+  }
+
   const [mediaLinks, relatedArtworks, reviewAggregate] = await Promise.all([
     prisma.artworkMedia.findMany({ where: { artworkId }, orderBy: { sort: 'asc' } }),
     prisma.artwork.findMany({
       where: {
         category: artwork.category,
         published: true,
+        sold: false,
         id: { not: artworkId },
       },
       orderBy: { createdAt: 'desc' },

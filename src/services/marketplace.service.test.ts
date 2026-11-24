@@ -9,8 +9,11 @@ import { AppError } from '@/middlewares';
 
 const { prismaMock, redisMock, tryGetRedisClientMock } = vi.hoisted(() => {
   const prisma = {
-    artwork: { findMany: vi.fn() },
+    artwork: { findMany: vi.fn(), updateMany: vi.fn() },
     artistProfile: { findMany: vi.fn() },
+    order: { findUnique: vi.fn(), updateMany: vi.fn() },
+    transaction: { create: vi.fn() },
+    $transaction: vi.fn(),
     $queryRaw: vi.fn(),
   };
   const redis = {
@@ -25,14 +28,45 @@ const { prismaMock, redisMock, tryGetRedisClientMock } = vi.hoisted(() => {
 vi.mock('@/services', () => ({ prisma: prismaMock }));
 vi.mock('./redis.service', () => ({ tryGetRedisClient: tryGetRedisClientMock }));
 
-import { browseArtworks, listTrendingArtworks } from './marketplace.service';
+import {
+  browseArtworks,
+  completeMarketplacePurchase,
+  getMarketplaceOrder,
+  listTrendingArtworks,
+} from './marketplace.service';
 import { convertAmount, getRate, tryConvertAmount } from './price-conversion.service';
 import { searchArtworks } from './search.service';
 
 const originalFetch = global.fetch;
 
+const ORDER_ID = 'order-1';
+
+function makeOrder(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    id: ORDER_ID,
+    buyerId: 'buyer-1',
+    sellerId: 'seller-1',
+    artworkId: 'artwork-1',
+    amount: 100,
+    asset: 'USDC',
+    platformFee: 5,
+    status: 'PROCESSING',
+    idempotencyKey: null,
+    txHash: null,
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // Run transaction callbacks against the same mock so every write made by a
+  // transaction is observable in one place, like Prisma's interactive
+  // transactions hand back a client bound to the transaction.
+  prismaMock.$transaction.mockImplementation(
+    async (callback: (tx: typeof prismaMock) => Promise<unknown>) => callback(prismaMock),
+  );
 });
 
 afterEach(() => {
@@ -99,9 +133,7 @@ describe('search ranking', () => {
     expect(first.total).toBe(5);
     expect(first.hasNext).toBe(true);
 
-    prismaMock.$queryRaw
-      .mockResolvedValueOnce([{ count: 5 }])
-      .mockResolvedValueOnce([{ id: 'e' }]);
+    prismaMock.$queryRaw.mockResolvedValueOnce([{ count: 5 }]).mockResolvedValueOnce([{ id: 'e' }]);
 
     const last = await searchArtworks('pagination-last', {}, 3, 2);
     expect(last.total).toBe(5);
@@ -400,5 +432,146 @@ describe('price conversion accuracy', () => {
     global.fetch = vi.fn() as unknown as typeof fetch;
 
     await expect(tryConvertAmount(10, 'NGNT', 'XLM')).resolves.toBeNull();
+  });
+});
+
+describe('marketplace order lookup (#57)', () => {
+  const order = makeOrder();
+
+  it('returns a known order', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(order);
+
+    await expect(getMarketplaceOrder(order.id)).resolves.toEqual(order);
+  });
+
+  it('reports an unknown order id as a stable NOT_FOUND', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(null);
+
+    await expect(getMarketplaceOrder('missing-order')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+  });
+
+  it('preserves other service failures instead of masking them as missing orders', async () => {
+    const failure = new Error('database unavailable');
+    prismaMock.order.findUnique.mockRejectedValue(failure);
+
+    await expect(getMarketplaceOrder(order.id)).rejects.toBe(failure);
+  });
+});
+
+describe('purchase settlement callback (#56, #59)', () => {
+  const orderId = ORDER_ID;
+  const txHash = '0x-settled-tx';
+
+  it('completes a PROCESSING order, sells the artwork, and records one purchase entry', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(makeOrder());
+    prismaMock.order.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.artwork.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.transaction.create.mockResolvedValue({ id: 'ledger-1' });
+
+    const result = await completeMarketplacePurchase(orderId, txHash);
+
+    expect(result.duplicate).toBe(false);
+    expect(result.order.status).toBe('COMPLETED');
+    expect(result.order.txHash).toBe(txHash);
+    expect(prismaMock.order.updateMany).toHaveBeenCalledWith({
+      where: { id: orderId, status: 'PROCESSING' },
+      data: { status: 'COMPLETED', txHash },
+    });
+    expect(prismaMock.artwork.updateMany).toHaveBeenCalledWith({
+      where: { id: 'artwork-1', sold: false },
+      data: { sold: true },
+    });
+    expect(prismaMock.transaction.create).toHaveBeenCalledExactlyOnceWith({
+      data: expect.objectContaining({
+        orderId,
+        userId: 'buyer-1',
+        type: 'PURCHASE',
+        amount: 100,
+        asset: 'USDC',
+        txHash,
+        confirmed: true,
+      }),
+    });
+  });
+
+  it('settles once when the same callback is delivered twice', async () => {
+    prismaMock.order.findUnique
+      .mockResolvedValueOnce(makeOrder())
+      .mockResolvedValueOnce(makeOrder({ status: 'COMPLETED', txHash }));
+    prismaMock.order.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.artwork.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.transaction.create.mockResolvedValue({ id: 'ledger-1' });
+
+    const first = await completeMarketplacePurchase(orderId, txHash);
+    const second = await completeMarketplacePurchase(orderId, txHash);
+
+    expect(first.duplicate).toBe(false);
+    expect(second.duplicate).toBe(true);
+    expect(prismaMock.transaction.create).toHaveBeenCalledTimes(1);
+    expect(prismaMock.artwork.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not repeat side effects for an already-completed order', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(
+      makeOrder({ status: 'COMPLETED', txHash: '0x-original' }),
+    );
+
+    const result = await completeMarketplacePurchase(orderId, txHash);
+
+    expect(result.duplicate).toBe(true);
+    expect(result.order.txHash).toBe('0x-original');
+    expect(prismaMock.order.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.artwork.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it.each(['PENDING', 'FAILED', 'REFUNDED'] as const)(
+    'rejects settlement of a %s order without writing anything',
+    async (status) => {
+      prismaMock.order.findUnique.mockResolvedValue(makeOrder({ status }));
+
+      await expect(completeMarketplacePurchase(orderId, txHash)).rejects.toMatchObject({
+        code: 'CONFLICT',
+      });
+      expect(prismaMock.order.updateMany).not.toHaveBeenCalled();
+      expect(prismaMock.artwork.updateMany).not.toHaveBeenCalled();
+      expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reports a missing order as NOT_FOUND without side effects', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(null);
+
+    await expect(completeMarketplacePurchase(orderId, txHash)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the claim when a concurrent callback settles the order first', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(makeOrder());
+    // A competing callback completed the order between our read and our claim.
+    prismaMock.order.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(completeMarketplacePurchase(orderId, txHash)).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(prismaMock.artwork.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
+  });
+
+  it('rolls back when another order already sold the artwork', async () => {
+    prismaMock.order.findUnique.mockResolvedValue(makeOrder());
+    prismaMock.order.updateMany.mockResolvedValue({ count: 1 });
+    // The conditional artwork claim lost the race: the artwork is already sold.
+    prismaMock.artwork.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(completeMarketplacePurchase(orderId, txHash)).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(1);
+    expect(prismaMock.transaction.create).not.toHaveBeenCalled();
   });
 });

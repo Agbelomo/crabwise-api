@@ -521,3 +521,57 @@ describe('listing cache invalidation', () => {
     expect(invalidateNamespaceMock).not.toHaveBeenCalled();
   });
 });
+
+describe('getArtworkDetail — public visibility filtering', () => {
+  beforeEach(() => {
+    prismaMock.artworkMedia.findMany.mockResolvedValue([]);
+    prismaMock.artwork.findMany.mockResolvedValue([]);
+    prismaMock.review.aggregate.mockResolvedValue({
+      _avg: { rating: null },
+      _count: { rating: 0 },
+    });
+  });
+
+  it('returns the detail for a published, unsold artwork', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: true, sold: false }));
+
+    const detail = await getArtworkDetail(ARTWORK_ID, undefined);
+
+    expect(detail.artwork.id).toBe(ARTWORK_ID);
+  });
+
+  it('hides an unpublished artwork behind the same not-found response as a missing one', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: false, sold: false }));
+
+    await expect(getArtworkDetail(ARTWORK_ID, undefined)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+    expect(prismaMock.artworkMedia.findMany).not.toHaveBeenCalled();
+    expect(prismaMock.review.aggregate).not.toHaveBeenCalled();
+  });
+
+  it('hides an already-sold artwork', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: true, sold: true }));
+
+    await expect(getArtworkDetail(ARTWORK_ID, undefined)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    });
+  });
+
+  it('excludes unpublished and sold artworks from related results', async () => {
+    prismaMock.artwork.findUnique.mockResolvedValue(makeArtwork({ published: true, sold: false }));
+
+    await getArtworkDetail(ARTWORK_ID, undefined);
+
+    expect(prismaMock.artwork.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          category: 'DIGITAL_PAINTING',
+          published: true,
+          sold: false,
+          id: { not: ARTWORK_ID },
+        }),
+      }),
+    );
+  });
+});
