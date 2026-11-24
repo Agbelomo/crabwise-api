@@ -9,7 +9,7 @@
  * changes made outside this service (e.g. an artwork being marked sold).
  */
 
-import type { Asset, Artwork, ArtworkCategory } from '@prisma/client';
+import { Prisma, type Asset, type Artwork, type ArtworkCategory } from '@prisma/client';
 
 import { AppError } from '@/middlewares';
 import { prisma } from '@/services';
@@ -30,6 +30,7 @@ export interface ArtworkPage {
 
 const LISTING_CACHE_TTL_SECONDS = 5 * 60;
 const LISTING_CACHE_NAMESPACE = 'artworks:list';
+const ARTWORK_NOT_FOUND = 'Artwork not found';
 
 function listingCacheKey(filters: ListArtworksFilters, page: number, limit: number): string {
   return `artworks:list:${JSON.stringify({ filters, page, limit })}`;
@@ -79,10 +80,31 @@ export interface UpdateArtworkInput {
   readonly asset?: Asset;
 }
 
+function artworkNotFound(): AppError {
+  return new AppError('NOT_FOUND', ARTWORK_NOT_FOUND);
+}
+
+/**
+ * A write that follows an ownership lookup can still find nothing: another
+ * request can delete the artwork in between. Prisma reports that as `P2025`
+ * ("record to update/delete not found"), which would otherwise surface as an
+ * internal error. Resolve both paths to the same stable not-found result.
+ */
+async function withArtworkNotFound<T>(write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+      throw artworkNotFound();
+    }
+    throw err;
+  }
+}
+
 async function findOwnedArtwork(userId: string, artworkId: string) {
   const artwork = await prisma.artwork.findUnique({ where: { id: artworkId } });
   if (artwork === null) {
-    throw new AppError('NOT_FOUND', 'Artwork not found');
+    throw artworkNotFound();
   }
   if (artwork.userId !== userId) {
     throw new AppError('FORBIDDEN', 'You do not own this artwork');
@@ -109,17 +131,19 @@ export async function createArtwork(userId: string, input: CreateArtworkInput) {
 
 export async function updateArtwork(userId: string, artworkId: string, input: UpdateArtworkInput) {
   await findOwnedArtwork(userId, artworkId);
-  const artwork = await prisma.artwork.update({
-    where: { id: artworkId },
-    data: {
-      title: input.title,
-      description: input.description,
-      category: input.category,
-      tags: input.tags === undefined ? undefined : input.tags,
-      price: input.price,
-      asset: input.asset,
-    },
-  });
+  const artwork = await withArtworkNotFound(() =>
+    prisma.artwork.update({
+      where: { id: artworkId },
+      data: {
+        title: input.title,
+        description: input.description,
+        category: input.category,
+        tags: input.tags === undefined ? undefined : input.tags,
+        price: input.price,
+        asset: input.asset,
+      },
+    }),
+  );
   await invalidateNamespace(LISTING_CACHE_NAMESPACE);
   return artwork;
 }
@@ -127,7 +151,7 @@ export async function updateArtwork(userId: string, artworkId: string, input: Up
 export async function getArtworkById(artworkId: string): Promise<Artwork> {
   const artwork = await prisma.artwork.findUnique({ where: { id: artworkId } });
   if (artwork === null) {
-    throw new AppError('NOT_FOUND', 'Artwork not found');
+    throw artworkNotFound();
   }
   return artwork;
 }
@@ -150,14 +174,16 @@ export async function setArtworkPublished(userId: string, artworkId: string, pub
     }
   }
 
-  const updated = await prisma.artwork.update({ where: { id: artworkId }, data: { published } });
+  const updated = await withArtworkNotFound(() =>
+    prisma.artwork.update({ where: { id: artworkId }, data: { published } }),
+  );
   await invalidateNamespace(LISTING_CACHE_NAMESPACE);
   return updated;
 }
 
 export async function deleteArtwork(userId: string, artworkId: string): Promise<void> {
   await findOwnedArtwork(userId, artworkId);
-  await prisma.artwork.delete({ where: { id: artworkId } });
+  await withArtworkNotFound(() => prisma.artwork.delete({ where: { id: artworkId } }));
   await invalidateNamespace(LISTING_CACHE_NAMESPACE);
 }
 

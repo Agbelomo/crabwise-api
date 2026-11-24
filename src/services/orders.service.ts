@@ -1,17 +1,22 @@
 /**
- * Order creation.
+ * Order creation and status transitions.
  *
  * Purchasing an artwork creates a PENDING order priced off the artwork's
- * listed price/asset, plus a platform fee. Payment capture, status
- * transitions, and delivery are out of scope here — this only covers the
- * "initiate a purchase" step.
+ * listed price/asset, plus a platform fee. Payment capture and delivery are
+ * out of scope here — payment intents are built in `stellar-payment.service`,
+ * and fulfillment flips the status through `transitionOrderStatus`.
+ *
+ * Both parties are pinned at creation time: the buyer is the authenticated
+ * caller and the seller is the artwork's owner as read from the database, so
+ * request input can never choose them.
  */
 
-import { Prisma, type Order } from '@prisma/client';
+import { Prisma, type Artwork, type Order, type OrderStatus } from '@prisma/client';
 
 import { env } from '@/config';
 import { AppError } from '@/middlewares';
 import { prisma } from '@/services';
+import { logger } from '@/utils';
 import { calculatePlatformFee } from '@/utils/fee';
 
 export interface CreateOrderInput {
@@ -24,13 +29,69 @@ export interface OrderSummary {
   readonly total: string;
 }
 
+export interface OrderTransitionResult {
+  readonly order: Order;
+  readonly previousStatus: OrderStatus;
+}
+
 /** Order statuses that mean "this purchase already exists" — a new attempt
  * for the same buyer/artwork is rejected rather than creating a second
  * order. FAILED/REFUNDED orders don't block a retry. */
 const BLOCKING_STATUSES = ['PENDING', 'PROCESSING', 'COMPLETED'] as const;
 
+/**
+ * The order state machine documented with the schema: payment must move an
+ * order through PROCESSING before it can be COMPLETED, and only a completed
+ * order can be refunded. FAILED and REFUNDED are terminal, so a payment
+ * cannot be replayed against an order that already ended.
+ */
+const ORDER_STATUS_TRANSITIONS: Readonly<Record<OrderStatus, readonly OrderStatus[]>> = {
+  PENDING: ['PROCESSING', 'FAILED'],
+  PROCESSING: ['COMPLETED', 'FAILED'],
+  COMPLETED: ['REFUNDED'],
+  FAILED: [],
+  REFUNDED: [],
+};
+
+const ORDER_ERROR_MESSAGES = {
+  create: 'Could not complete the order. Please try again.',
+  transition: 'Could not update the order status. Please try again.',
+} as const;
+
 function isUniqueViolation(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002';
+}
+
+/**
+ * Logs the underlying persistence failure server-side, then returns a stable
+ * client-facing error. Internal messages (driver text, query values,
+ * connection details) stay in the log and out of the response body.
+ */
+function orderPersistenceFailure(
+  action: keyof typeof ORDER_ERROR_MESSAGES,
+  err: unknown,
+): AppError {
+  logger.error(`orders: failed to ${action}`, {
+    name: err instanceof Error ? err.name : typeof err,
+    message: err instanceof Error ? err.message : String(err),
+  });
+  return new AppError('INTERNAL_ERROR', ORDER_ERROR_MESSAGES[action], { cause: err });
+}
+
+/**
+ * Freezes the two parties of a purchase. The buyer is always the
+ * authenticated caller; the seller is always the artwork's owner. Neither is
+ * read from request input, and storing both on the order keeps the deal
+ * intact if the artwork later changes hands.
+ */
+function orderPartiesFor(
+  buyerId: string,
+  artwork: Artwork,
+): { readonly buyerId: string; readonly sellerId: string } {
+  if (artwork.userId === buyerId) {
+    throw new AppError('FORBIDDEN', 'You cannot purchase your own artwork');
+  }
+  return { buyerId, sellerId: artwork.userId };
 }
 
 function toSummary(order: Order): OrderSummary {
@@ -42,9 +103,7 @@ export async function createOrder(buyerId: string, input: CreateOrderInput): Pro
   if (artwork === null) {
     throw new AppError('NOT_FOUND', 'Artwork not found');
   }
-  if (artwork.userId === buyerId) {
-    throw new AppError('FORBIDDEN', 'You cannot purchase your own artwork');
-  }
+  const parties = orderPartiesFor(buyerId, artwork);
   if (!artwork.published || artwork.sold) {
     throw new AppError('UNPROCESSABLE_ENTITY', 'Artwork is not available for purchase');
   }
@@ -76,8 +135,8 @@ export async function createOrder(buyerId: string, input: CreateOrderInput): Pro
   try {
     const order = await prisma.order.create({
       data: {
-        buyerId,
-        sellerId: artwork.userId,
+        buyerId: parties.buyerId,
+        sellerId: parties.sellerId,
         artworkId: artwork.id,
         amount: artwork.price,
         asset: artwork.asset,
@@ -96,7 +155,65 @@ export async function createOrder(buyerId: string, input: CreateOrderInput): Pro
       if (raced !== null) {
         return toSummary(raced);
       }
+      throw new AppError('CONFLICT', 'This idempotency key has already been used');
     }
-    throw err;
+    throw orderPersistenceFailure('create', err);
   }
+}
+
+export function isOrderStatusTransitionAllowed(from: OrderStatus, to: OrderStatus): boolean {
+  return ORDER_STATUS_TRANSITIONS[from].includes(to);
+}
+
+/**
+ * Applies an order status transition, rejecting transitions that skip a
+ * required payment or fulfillment step. The write is conditional on the
+ * status that was read, so two concurrent callbacks can't both apply a
+ * transition from the same state.
+ */
+export async function transitionOrderStatus(
+  orderId: string,
+  nextStatus: OrderStatus,
+): Promise<OrderTransitionResult> {
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (order === null) {
+    throw new AppError('NOT_FOUND', 'Order not found');
+  }
+
+  const allowedTransitions = ORDER_STATUS_TRANSITIONS[order.status];
+  if (!allowedTransitions.includes(nextStatus)) {
+    throw new AppError('CONFLICT', `Order cannot move from ${order.status} to ${nextStatus}`, {
+      details: {
+        currentStatus: order.status,
+        requestedStatus: nextStatus,
+        allowedTransitions,
+      },
+    });
+  }
+
+  let applied: { readonly count: number };
+  try {
+    applied = await prisma.order.updateMany({
+      where: { id: orderId, status: order.status },
+      data: { status: nextStatus },
+    });
+  } catch (err) {
+    throw orderPersistenceFailure('transition', err);
+  }
+
+  if (applied.count === 0) {
+    throw new AppError('CONFLICT', 'Order status changed during the transition; reload and retry', {
+      details: {
+        currentStatus: order.status,
+        requestedStatus: nextStatus,
+      },
+    });
+  }
+
+  const updated = await prisma.order.findUnique({ where: { id: orderId } });
+  if (updated === null) {
+    throw new AppError('NOT_FOUND', 'Order not found');
+  }
+
+  return { order: updated, previousStatus: order.status };
 }
